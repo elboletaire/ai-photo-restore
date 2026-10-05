@@ -1,0 +1,12 @@
+__pycache__/
+
+# Never commit photos or restoration outputs: they are personal data.
+restored*/
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.webp
+*.bmp
+*.heic

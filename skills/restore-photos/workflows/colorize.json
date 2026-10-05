@@ -1,0 +1,38 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    },
+    "_meta": {
+      "title": "Input image"
+    }
+  },
+  "2": {
+    "class_type": "DDColor_Colorize",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "model_input_size": 512,
+      "checkpoint": "ddcolor_modelscope.pth"
+    },
+    "_meta": {
+      "title": "Colorize"
+    }
+  },
+  "3": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "filename_prefix": "restore/color"
+    },
+    "_meta": {
+      "title": "Output"
+    }
+  }
+}

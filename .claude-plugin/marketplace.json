@@ -1,0 +1,30 @@
+{
+  "name": "photo-restore",
+  "owner": {
+    "name": "elboletaire"
+  },
+  "metadata": {
+    "description": "Old photo restoration for Claude Code",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "photo-restore",
+      "source": "./",
+      "description": "Restore and colorize old photographs with ComfyUI (local GPU) or fal.ai (cloud).",
+      "version": "0.1.0",
+      "author": {
+        "name": "elboletaire"
+      },
+      "license": "MIT",
+      "keywords": [
+        "photo",
+        "restoration",
+        "colorization",
+        "comfyui",
+        "fal"
+      ],
+      "category": "productivity"
+    }
+  ]
+}

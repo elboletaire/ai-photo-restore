@@ -1,0 +1,70 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    },
+    "_meta": {
+      "title": "Input image"
+    }
+  },
+  "2": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    }
+  },
+  "3": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "2",
+        0
+      ],
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Upscale"
+    }
+  },
+  "4": {
+    "class_type": "FaceRestoreModelLoader",
+    "inputs": {
+      "model_name": "codeformer-v0.1.0.pth"
+    }
+  },
+  "5": {
+    "class_type": "FaceRestoreCFWithModel",
+    "inputs": {
+      "facerestore_model": [
+        "4",
+        0
+      ],
+      "image": [
+        "3",
+        0
+      ],
+      "facedetection": "retinaface_resnet50",
+      "codeformer_fidelity": 0.7
+    },
+    "_meta": {
+      "title": "Face restore"
+    }
+  },
+  "6": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "5",
+        0
+      ],
+      "filename_prefix": "restore/conservative"
+    },
+    "_meta": {
+      "title": "Output"
+    }
+  }
+}

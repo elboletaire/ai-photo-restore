@@ -1,0 +1,16 @@
+{
+  "name": "photo-restore",
+  "description": "Restore and colorize old photographs with ComfyUI (local GPU) or fal.ai (cloud).",
+  "version": "0.1.0",
+  "author": {
+    "name": "elboletaire"
+  },
+  "license": "MIT",
+  "keywords": [
+    "photo",
+    "restoration",
+    "colorization",
+    "comfyui",
+    "fal"
+  ]
+}
