@@ -6,12 +6,13 @@ It runs **locally** on your GPU through [ComfyUI](https://github.com/Comfy-Org/C
 
 ## What it does
 
-For every photo you get up to three variants, each one finished and compared with the original on a single page (`restored/index.html`, with before/after sliders):
+For every photo you get up to four variants, each one finished and compared with the original on a single page (`restored/index.html`, with before/after sliders):
 
 | Variant | Models | Good for |
 |---|---|---|
 | **Conservative** (always) | RealESRGAN x2 + [CodeFormer](https://github.com/sczhou/CodeFormer) | Faithful: sharper faces and more resolution, nothing invented. Doesn't remove damage. |
 | **Generative** (`--generative`) | [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Damaged photos: tears, stains, scratches, missing corners. Can subtly alter faces, so always compare. |
+| **Repaired** (`--repair`, local only) | Qwen-Image-Edit-2511 on the damaged areas only, then RealESRGAN + CodeFormer | Holes, missing corners, peeled emulsion. Everything that isn't damaged, faces included, stays the original. |
 | **Colorized** (`--colorize`) | [DDColor](https://github.com/piddnad/DDColor) | Natural colours, keeps the original detail (only predicts colour, never changes luminance). |
 
 Black-and-white and sepia results keep the print's own tint. AI restorers invent colour (blue eyes, pink skin) even on monochrome photos; the pipeline keeps only their luminance and rebuilds the tint from the original.

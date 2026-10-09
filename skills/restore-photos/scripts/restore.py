@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -40,6 +41,10 @@ HERE = Path(__file__).resolve().parent
 WORKFLOWS = HERE.parent / "workflows"
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
 
+REPAIR_PROMPT = (
+    "Repair the damaged areas of this old photograph: fill in the missing, torn and peeled patches so they "
+    "continue the surrounding picture seamlessly. Keep it a black and white photograph."
+)
 RESTORE_PROMPT = (
     "Restore this old photograph. Remove scratches, dust, stains, creases and paper damage. "
     "Recover sharp natural detail and clean tonal range. Keep the exact same people, faces, "
@@ -55,6 +60,15 @@ def read_image(path: Path) -> np.ndarray:
     if img is None:
         raise ValueError(f"cannot read image {path}")
     return img
+
+
+def read_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
+    """A black and white mask (white = damaged) at `shape` (h, w), as 0/255."""
+    m = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise ValueError(f"cannot read mask {path}")
+    m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    return np.where(m > 127, 255, 0).astype(np.uint8)
 
 
 def write_image(path: Path, img: np.ndarray) -> None:
@@ -130,6 +144,83 @@ def finish(img: np.ndarray, tone: str, sharpen: bool = True, saturation: float =
     return from_lab(lab)
 
 
+def align_to(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Resize `img` to `ref`'s size and fine-align it (affine): generative output is rescaled and slightly shifted."""
+    h, w = ref.shape[:2]
+    img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    s = min(1.0, 1000 / max(h, w))
+    small = [cv2.resize(cv2.cvtColor(i, cv2.COLOR_BGR2GRAY), None, fx=s, fy=s).astype(np.float32) for i in (ref, img)]
+    warp = np.eye(2, 3, dtype=np.float32)
+    try:
+        _, warp = cv2.findTransformECC(*small, warp, cv2.MOTION_AFFINE,
+                                       (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5), None, 5)
+    except cv2.error:
+        return img  # didn't converge: keep the plain resize
+    warp[:, 2] /= s
+    return cv2.warpAffine(img, warp, (w, h), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REFLECT)
+
+
+def scanner_background(img: np.ndarray) -> np.ndarray:
+    """Mask of the grey scanner bed around the photo: neutral pixels connected to the image border.
+
+    Old prints and their mounts are toned (sepia, cream), the scanner lid is not.
+    """
+    lab = to_lab(cv2.GaussianBlur(img, (0, 0), 2))
+    neutral = (np.hypot(lab[..., 1], lab[..., 2]) < 6).astype(np.uint8)
+    n, labels = cv2.connectedComponents(neutral)
+    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    bg = np.isin(labels, border[border > 0]).astype(np.uint8)
+    r = max(3, round(max(img.shape[:2]) / 200))  # plus the soft shadow along the card's edge
+    return cv2.dilate(bg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+
+
+def damage_mask(original: np.ndarray, generative: np.ndarray, threshold: float = 15) -> np.ndarray:
+    """Where the original is damaged (0/255), found by comparing it with the generative restoration.
+
+    Holes, peeled emulsion and stains show the light paper underneath, so they are where the original is
+    much lighter than the generative version once both have the same overall brightness. Requiring
+    "lighter" (not just "different") leaves out what the model merely redrew: faces, lace, highlights.
+    """
+    h, w = original.shape[:2]
+    L0 = to_lab(original)[..., 0]
+    L1 = to_lab(align_to(generative, original))[..., 0]
+    (a25, a50, a75), (b25, b50, b75) = np.percentile(L0, [25, 50, 75]), np.percentile(L1, [25, 50, 75])
+    L1 = (L1 - b50) * ((a75 - a25) / (b75 - b25) if b75 - b25 > 1 else 1.0) + a50  # same median and spread
+    sigma = max(h, w) / 400
+    lighter = cv2.GaussianBlur(L0, (0, 0), sigma) - cv2.GaussianBlur(L1, (0, 0), sigma) > threshold
+    m = cv2.morphologyEx(lighter.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m)
+    big = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= h * w * 0.0002)
+    m = np.isin(labels, big[big > 0]).astype(np.uint8)
+    m[scanner_background(original) > 0] = 0
+    r = max(2, round(max(h, w) / 300))  # cover the ragged edges of the holes
+    return cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) * 255
+
+
+def damage_overlay(original: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    out = original.copy()
+    hit = mask > 0
+    out[hit] = (0.5 * out[hit] + [0, 0, 127]).astype(np.uint8)
+    return out
+
+
+def mask_box(mask: np.ndarray, pad: float = 0.1) -> tuple[int, int, int, int]:
+    """Bounding box (x0, y0, x1, y1) of the mask, padded so the model sees the surroundings."""
+    ys, xs = np.nonzero(mask)
+    h, w = mask.shape
+    p = round(pad * max(h, w))
+    return max(0, xs.min() - p), max(0, ys.min() - p), min(w, xs.max() + 1 + p), min(h, ys.max() + 1 + p)
+
+
+def paste(original: np.ndarray, patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Original everywhere except under `mask`, where `patch` (same size) goes, with feathered edges."""
+    r = max(1.0, max(mask.shape) / 600)
+    alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), r)[..., None]
+    alpha = np.maximum(alpha, (mask > 0)[..., None])  # feather outwards only: the damage itself must go
+    return (original * (1 - alpha) + patch * alpha + 0.5).astype(np.uint8)
+
+
 # ---------------------------------------------------------------- backends
 
 class ComfyBackend:
@@ -156,7 +247,7 @@ class ComfyBackend:
                 spec = {**inputs.get("optional", {}), **inputs.get("required", {})}
                 for key, value in node["inputs"].items():
                     options = combo_options(spec.get(key))
-                    if options is not None and isinstance(value, str) and value not in options and cls != "LoadImage":
+                    if options is not None and isinstance(value, str) and value not in options and cls not in ("LoadImage", "LoadImageMask"):
                         problems.append(f"{wf}: {cls}.{key} = {value} not installed (run setup-local)")
         return problems
 
@@ -210,6 +301,15 @@ class ComfyBackend:
         set_input(wf, "Scale", "megapixels", megapixels)
         return self._run(wf)
 
+    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float) -> bytes:
+        wf = load_workflow("repair")
+        set_input(wf, "Input image", "image", self._upload(path))
+        set_input(wf, "Mask", "image", self._upload(mask))
+        set_input(wf, "Prompt", "prompt", prompt)
+        set_input(wf, "Sampler", "seed", seed)
+        set_input(wf, "Scale", "megapixels", megapixels)
+        return self._run(wf)
+
     def colorize(self, path: Path) -> bytes:
         wf = load_workflow("colorize")
         set_input(wf, "Input image", "image", self._upload(path))
@@ -223,7 +323,10 @@ class FalBackend:
         self.key = os.environ.get("FAL_KEY", "")
 
     def check(self, stages: list[str]) -> list[str]:
-        return [] if self.key else ["FAL_KEY is not set (create one at https://fal.ai/dashboard/keys)"]
+        problems = [] if self.key else ["FAL_KEY is not set (create one at https://fal.ai/dashboard/keys)"]
+        if "repair" in stages:
+            problems.append("--repair only works with the local backend for now")
+        return problems
 
     def _call(self, endpoint: str, payload: dict) -> bytes:
         r = requests.post(f"https://fal.run/{endpoint}", json=payload, timeout=600,
@@ -251,6 +354,9 @@ class FalBackend:
     def generative(self, path: Path, prompt: str, seed: int, megapixels: float) -> bytes:
         return self._call("fal-ai/qwen-image-edit-2511", {"image_urls": [self._data_uri(path)], "prompt": prompt,
                                                           "seed": seed, "output_format": "png"})
+
+    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float) -> bytes:
+        raise RuntimeError("--repair only works with the local backend for now")
 
     def colorize(self, path: Path) -> bytes:
         return self._call("fal-ai/ddcolor", {"image_url": self._data_uri(path)})
@@ -317,15 +423,15 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
-def stage(target: Path, label: str, inputs: Path, settings: dict, force: bool, produce) -> None:
-    """Run an AI stage unless `target` was already made from the same input file and settings.
+def stage(target: Path, label: str, inputs: list[Path], settings: dict, force: bool, produce) -> None:
+    """Run an AI stage unless `target` was already made from the same input files and settings.
 
     What each stage was made from is recorded in stages.json next to it, so changing --seed,
     --fidelity, the backend, or recomputing an upstream stage reruns it automatically.
     """
     record = target.parent / "stages.json"
     done = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
-    key = {**settings, "input": digest(inputs)}
+    key = {**settings, "inputs": [digest(p) for p in inputs]}
     if target.exists() and not force and done.get(target.name) == key:
         print(f"  = {label} (cached)")
         return
@@ -334,6 +440,26 @@ def stage(target: Path, label: str, inputs: Path, settings: dict, force: bool, p
     done[target.name] = key
     record.write_text(json.dumps(done, indent=2), encoding="utf-8")
     print(f"  ✓ {label} ({time.time() - t0:.1f}s)", flush=True)
+
+
+def repair_damage(backend, original: Path, mask: Path, a) -> bytes:
+    """Regenerate only the masked areas: send the damaged region (with some context) to the model,
+    then paste its result back under the mask. Everything outside the mask stays the original."""
+    img = read_image(original)
+    m = read_mask(mask, img.shape[:2])
+    if not m.any():
+        return cv2.imencode(".png", img)[1].tobytes()
+    x0, y0, x1, y1 = mask_box(m)
+    crop, mcrop = img[y0:y1, x0:x1], m[y0:y1, x0:x1]
+    with tempfile.TemporaryDirectory() as tmp:
+        crop_path, mask_path = Path(tmp) / "crop.png", Path(tmp) / "mask.png"
+        write_image(crop_path, crop)
+        write_image(mask_path, mcrop)
+        out = cv2.imdecode(np.frombuffer(backend.repair(crop_path, mask_path, a.repair_prompt, a.seed, a.megapixels),
+                                         np.uint8), cv2.IMREAD_COLOR)
+    patch = tone_match(cv2.resize(out, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LANCZOS4), crop)
+    img[y0:y1, x0:x1] = paste(crop, patch, mcrop)
+    return cv2.imencode(".png", img)[1].tobytes()
 
 
 def output_names(files: list[Path]) -> list[str]:
@@ -359,25 +485,50 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         shutil.copyfile(src, original)
 
     conservative = d / "10-conservative.png"
-    stage(conservative, "conservative (upscale + CodeFormer)", original,
+    stage(conservative, "conservative (upscale + CodeFormer)", [original],
           {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
           lambda: backend.conservative(original, a.fidelity, not a.no_upscale))
     variants = [(conservative, a.tone)]
 
     color_base = conservative
-    if a.generative:
+    if a.generative or a.repair:  # the repair finds the damage by comparing with the generative variant
         generative = d / "20-generative.png"
-        stage(generative, "generative (Qwen-Image-Edit-2511)", original,
+        stage(generative, "generative (Qwen-Image-Edit-2511)", [original],
               {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels}, a.force,
               lambda: backend.generative(original, a.prompt, a.seed, a.megapixels))
         variants.append((generative, a.tone))
         color_base = generative
 
+    if a.repair:
+        orig_img = read_image(original)
+        if a.mask:
+            m = read_mask(Path(a.mask).expanduser(), orig_img.shape[:2])
+        else:
+            m = damage_mask(orig_img, read_image(generative))
+        mask = d / "25-damage-mask.png"
+        write_image(mask, m)
+        write_image(d / "25-damage-overlay.jpg", damage_overlay(orig_img, m))
+        print(f"  ✓ damage mask ({'from ' + a.mask if a.mask else 'detected'}: {100 * (m > 0).mean():.1f}% of the photo)")
+        repaired_raw = d / "26-repaired-raw.png"
+        stage(repaired_raw, "repair (Qwen-Image-Edit-2511, damaged areas only)", [original, mask],
+              {"backend": backend.name, "prompt": a.repair_prompt, "seed": a.seed, "megapixels": a.megapixels},
+              a.force, lambda: repair_damage(backend, original, mask, a))
+        repaired = d / "27-repaired.png"
+        stage(repaired, "repaired: upscale + CodeFormer", [repaired_raw],
+              {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
+              lambda: backend.conservative(repaired_raw, a.fidelity, not a.no_upscale))
+        variants.append((repaired, a.tone))
+
     if a.colorize:
-        color = d / "30-color.png"
-        stage(color, "colorize (DDColor)", color_base, {"backend": backend.name}, a.force,
-              lambda: backend.colorize(color_base))
-        variants.append((color, "color"))
+        # The generative (or conservative) colour version, plus one of the repaired image: it keeps the
+        # original faces, but the generative one usually looks cleaner, so it doesn't replace it.
+        bases = [(color_base, d / "30-color.png")]
+        if a.repair:
+            bases.append((repaired, d / "31-repaired-color.png"))
+        for base, color in bases:
+            stage(color, f"colorize {base.stem} (DDColor)", [base], {"backend": backend.name}, a.force,
+                  lambda base=base: backend.colorize(base))
+            variants.append((color, "color"))
 
     orig_img = read_image(original)
     for path, tone in variants:
@@ -395,7 +546,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 def cmd_run(a) -> int:
     backend = make_backend(a.backend)
-    stages = ["conservative"] + ["generative"] * a.generative + ["colorize"] * a.colorize
+    stages = (["conservative"] + ["generative"] * (a.generative or a.repair) + ["repair"] * a.repair
+              + ["colorize"] * a.colorize)
     problems = backend.check(stages)
     if problems:
         print("backend not ready:\n  - " + "\n  - ".join(problems), file=sys.stderr)
@@ -403,6 +555,9 @@ def cmd_run(a) -> int:
     out_root = Path(a.out).expanduser().resolve()
     failed = 0
     files = collect_inputs(a.inputs)
+    if a.mask and (len(files) != 1 or not a.repair):
+        print("--mask needs --repair and a single photo", file=sys.stderr)
+        return 2
     for src, name in zip(files, output_names(files)):
         try:
             restore_one(src, out_root, backend, a, name)
@@ -416,7 +571,8 @@ def cmd_run(a) -> int:
 def cmd_doctor(a) -> int:
     backend = make_backend(a.backend)
     failed = []
-    for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("colorize", " (--colorize)")):
+    for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("repair", " (--repair)"),
+                       ("colorize", " (--colorize)")):
         problems = backend.check([name])
         print(f"{'✗' if problems else '✓'} {name}{flag}")
         for p in problems:
@@ -505,7 +661,8 @@ def cmd_setup_local(a) -> int:
 # ---------------------------------------------------------------- comparison page
 
 LABELS = {"10-conservative-final.jpg": "Conservative", "20-generative-final.jpg": "Generative",
-          "30-color-final.jpg": "Colorized"}
+          "27-repaired-final.jpg": "Repaired", "30-color-final.jpg": "Colorized",
+          "31-repaired-color-final.jpg": "Repaired, colorized"}
 
 
 def write_sheet(out_root: Path) -> Path:
@@ -569,6 +726,12 @@ def main() -> int:
     r.add_argument("--prompt", default=RESTORE_PROMPT, help="generative restoration prompt")
     r.add_argument("--seed", type=int, default=42)
     r.add_argument("--megapixels", type=float, default=1.0, help="generative working size (local backend)")
+    r.add_argument("--repair", action="store_true",
+                   help="add a variant that regenerates only the damaged areas (holes, peeled emulsion, stains); "
+                        "implies --generative, which it uses to find the damage")
+    r.add_argument("--mask", help="with --repair and a single photo: use this damage mask (white = damaged) "
+                                  "instead of the detected one")
+    r.add_argument("--repair-prompt", default=REPAIR_PROMPT, help="instruction for --repair")
     r.add_argument("--colorize", action="store_true", help="add a DDColor colorized variant")
     r.add_argument("--saturation", type=float, default=0.85,
                    help="colorized variant: colour strength (1 = as DDColor makes it, 0 = grey)")

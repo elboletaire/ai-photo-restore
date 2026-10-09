@@ -34,7 +34,7 @@ class FakeBackend:
 
 def args(**kw):
     defaults = dict(fidelity=0.7, no_upscale=False, generative=True, prompt="p", seed=42, megapixels=1.0,
-                    colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
+                    repair=False, mask=None, repair_prompt="r", colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
     return argparse.Namespace(**{**defaults, **kw})
 
 
@@ -128,3 +128,65 @@ def test_check_only_looks_at_requested_stages(monkeypatch):
     assert backend.check(["conservative", "colorize"]) == []
     assert backend.check(["generative"]) == [
         "generative: UNETLoader.unet_name = qwen_image_edit_2511_fp8mixed.safetensors not installed (run setup-local)"]
+
+
+def sepia(h=300, w=200, level=90):
+    lab = np.zeros((h, w, 3), np.float32)
+    lab[..., 0], lab[..., 1], lab[..., 2] = level / 2.55, 8, 25
+    return restore.from_lab(lab)
+
+
+def test_damage_mask_finds_light_holes_but_not_redrawn_areas():
+    original = sepia()
+    original[100:140, 60:120] = (200, 225, 235)  # bare paper where the emulsion peeled off
+    generative = sepia()
+    generative[20:50, 20:60] = 255  # the model brightened something that wasn't damaged
+    m = restore.damage_mask(original, generative)
+    assert m[120, 90] == 255
+    assert m[35, 40] == 0
+
+
+def test_damage_mask_ignores_the_scanner_bed():
+    original = np.full((300, 200, 3), 225, np.uint8)  # grey scanner lid
+    original[20:280, 20:180] = sepia(260, 160)
+    generative = sepia()  # the model extends the picture over the scanner bed
+    assert not restore.damage_mask(original, generative)[:20].any()
+
+
+def test_repair_only_changes_the_masked_area(tmp_path):
+    img = (np.random.default_rng(1).random((120, 90, 3)) * 255).astype(np.uint8)
+    original, mask = tmp_path / "original.png", tmp_path / "mask.png"
+    restore.write_image(original, img)
+    m = np.zeros((120, 90), np.uint8)
+    m[50:70, 30:60] = 255
+    restore.write_image(mask, m)
+
+    class Black:
+        def repair(self, path, mask, prompt, seed, megapixels):
+            crop = restore.read_image(path)
+            return cv2.imencode(".png", np.zeros((crop.shape[0] * 2, crop.shape[1] * 2, 3), np.uint8))[1].tobytes()
+
+    out = cv2.imdecode(np.frombuffer(restore.repair_damage(Black(), original, mask, args()), np.uint8), cv2.IMREAD_COLOR)
+    assert cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)[60, 45] < 40  # repaired (with the photo's tint)
+    far = np.ones((120, 90), bool)
+    far[40:80, 20:70] = False  # beyond the feathered edge
+    assert np.array_equal(out[far], img[far])
+
+
+def test_repair_runs_generative_and_keeps_a_user_mask(photo, tmp_path):
+    mask = tmp_path / "mask.png"
+    restore.write_image(mask, np.full((64, 48), 255, np.uint8))
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    restore.restore_one(photo, tmp_path / "out", b, args(generative=False, repair=True, colorize=False, mask=str(mask)))
+    assert b.calls == ["conservative", "generative", "repair", "conservative"]
+    assert (tmp_path / "out" / "photo" / "27-repaired-final.jpg").exists()
+
+
+def test_repair_adds_a_colour_version_without_replacing_the_generative_one(photo, tmp_path):
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    bases = []
+    b.colorize = lambda path: (bases.append(path.name), b._echo("colorize", path))[1]
+    restore.restore_one(photo, tmp_path / "out", b, args(repair=True))
+    assert bases == ["20-generative.png", "27-repaired.png"]

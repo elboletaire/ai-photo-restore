@@ -19,7 +19,10 @@ uv run <skill-dir>/scripts/restore.py <command> ...
 |---|---|---|---|
 | x2 upscale + face restoration | RealESRGAN + CodeFormer | `10-conservative.png` | always |
 | Generative restoration (removes scratches, stains, tears) | Qwen-Image-Edit-2511 | `20-generative.png` | `--generative` |
-| Colorization | DDColor | `30-color.png` | `--colorize` |
+| Damage mask: where the original is much lighter than the generative version (bare paper) | — | `25-damage-mask.png`, `25-damage-overlay.jpg` | `--repair` |
+| Repair: regenerate only the masked areas, then upscale + CodeFormer | Qwen-Image-Edit-2511, RealESRGAN, CodeFormer | `26-repaired-raw.png`, `27-repaired.png` | `--repair` (local only) |
+| Colorization of the generative variant (or the conservative one without `--generative`/`--repair`) | DDColor | `30-color.png` | `--colorize` |
+| Colorization of the repaired variant | DDColor | `31-repaired-color.png` | `--colorize --repair` |
 | Tone match: keep restored luminance, rebuild the print's original tint (removes colour the AI invents in eyes/skin of B/W photos) | — | (in memory) | B/W variants |
 | Finish: contrast, tone, sharpen | — | `*-final.jpg` | always |
 | Before/after page with sliders | — | `<out>/index.html` | always |
@@ -36,7 +39,8 @@ The backend can be preset with `RESTORE_BACKEND=local|fal`.
 ## 2. Look at each photo first
 
 Read the images and decide per photo:
-- **Damage** (tears, stains, scratches, missing areas) → add `--generative`. The conservative pass does not remove damage.
+- **Holes, missing corners, peeled emulsion** (light paper showing through) → add `--repair`. It regenerates only the damaged areas, so faces, the mount and the photographer's signature stay the original pixels. Prefer it to `--generative` for family photos: the generative variant redraws the whole photo, faces included. `--repair` also produces the generative variant (it uses it to find the damage), so you can compare both.
+- **Other damage** (stains, scratches, fading) → `--generative`. The conservative pass does not remove damage.
 - **Faces**: `--fidelity` 0.7 by default. Faces look waxy/changed → 0.8–0.9. Very blurry faces → 0.5.
 - **Large sharp scan** (> ~3000 px, faces already detailed) → `--no-upscale`.
 - **Tone** for B/W variants: `keep` (default, the print's own tint), `neutral` (grey) or `sepia`.
@@ -53,6 +57,8 @@ AI stages are cached per photo and rerun on their own when their input or settin
 `--prompt "..."` overrides the generative instruction for a specific photo (e.g. "also remove the handwritten date in the corner"). Keep the "keep the exact same people, faces, expressions…" part.
 
 ## 4. Review before reporting
+
+With `--repair`, first read `25-damage-overlay.jpg` (damage in red). Thin cracks, small specks and damage on light areas are often missed; damage on dark areas is found best. If the mask misses something important or covers something it shouldn't, make a corrected black and white mask (white = damaged, any size, the user can paint it in any editor) and rerun that photo with `--mask <file>`.
 
 Read each `*-final.jpg` next to `00-original.*` and check:
 - **Identity** — the most important check. Generative output can change face proportions, eyes or expression (e.g. remove a smile). If a person looks different, retry with another seed, or recommend the conservative variant.
