@@ -95,3 +95,8 @@ def test_examples_are_readable():
     assert len(photos) == 3
     for p in photos:
         assert restore.read_image(p).ndim == 3
+
+
+def test_output_names_number_duplicate_stems():
+    files = [Path("a/photo.jpg"), Path("b/photo.jpg"), Path("a/Photo.png"), Path("a/other.jpg")]
+    assert restore.output_names(files) == ["photo", "photo-2", "Photo-3", "other"]

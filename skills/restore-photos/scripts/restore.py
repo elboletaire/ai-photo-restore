@@ -313,10 +313,24 @@ def stage(target: Path, label: str, inputs: Path, settings: dict, force: bool, p
     print(f"  ✓ {label} ({time.time() - t0:.1f}s)", flush=True)
 
 
-def restore_one(src: Path, out_root: Path, backend, a) -> None:
-    d = out_root / src.stem
+def output_names(files: list[Path]) -> list[str]:
+    """One output folder name per input: the file stem, numbered when two inputs share it."""
+    names, seen = [], set()
+    for f in files:
+        name, n = f.stem, 1
+        while name.lower() in seen:  # case-insensitive, like Windows and macOS file systems
+            n += 1
+            name = f"{f.stem}-{n}"
+        seen.add(name.lower())
+        names.append(name)
+    return names
+
+
+def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) -> None:
+    name = name or src.stem
+    d = out_root / name
     d.mkdir(parents=True, exist_ok=True)
-    print(f"▶ {src.stem}  [{backend.name}]", flush=True)
+    print(f"▶ {name}  [{backend.name}]", flush=True)
     original = d / f"00-original{src.suffix.lower()}"
     if not original.exists() or digest(original) != digest(src):
         shutil.copyfile(src, original)
@@ -364,9 +378,10 @@ def cmd_run(a) -> int:
         return 2
     out_root = Path(a.out).expanduser().resolve()
     failed = 0
-    for src in collect_inputs(a.inputs):
+    files = collect_inputs(a.inputs)
+    for src, name in zip(files, output_names(files)):
         try:
-            restore_one(src, out_root, backend, a)
+            restore_one(src, out_root, backend, a, name)
         except Exception as e:  # keep going with the other photos
             failed += 1
             print(f"  ✗ {src.name}: {e}", file=sys.stderr)
