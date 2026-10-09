@@ -40,7 +40,7 @@ Read the images and decide per photo:
 - **Faces**: `--fidelity` 0.7 by default. Faces look waxy/changed → 0.8–0.9. Very blurry faces → 0.5.
 - **Large sharp scan** (> ~3000 px, faces already detailed) → `--no-upscale`.
 - **Tone** for B/W variants: `keep` (default, the print's own tint), `neutral` (grey) or `sepia`.
-- **Colorize** only if asked.
+- **Colorize** only if asked. `--saturation` (default 0.85) sets the colour strength; lower it if colours look painted-on, raise it towards 1 for DDColor's full colour.
 
 ## 3. Run
 
@@ -58,7 +58,7 @@ Read each `*-final.jpg` next to `00-original.*` and check:
 - **Identity** — the most important check. Generative output can change face proportions, eyes or expression (e.g. remove a smile). If a person looks different, retry with another seed, or recommend the conservative variant.
 - **Artifacts** — pasted-looking face edges or waxy skin (CodeFormer: raise fidelity), invented objects or text, broken hands.
 - **Composition** — framing, oval vignettes and borders kept.
-- **Colour** — DDColor sometimes over-saturates small items (pocket squares, flowers).
+- **Colour** — DDColor sometimes over-saturates small items (pocket squares, flowers). If the whole photo looks too colourful, rerun with a lower `--saturation` (instant, nothing is recomputed).
 
 Then point the user to `<out>/index.html` and recommend one variant per photo, saying why.
 

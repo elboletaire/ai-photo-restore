@@ -102,9 +102,16 @@ def tone_match(restored: np.ndarray, original: np.ndarray, bins: int = 64) -> np
     return from_lab(out)
 
 
-def finish(img: np.ndarray, tone: str, sharpen: bool = True) -> np.ndarray:
-    """Tonal finishing: contrast stretch on L, optional re-toning, light unsharp mask."""
+def finish(img: np.ndarray, tone: str, sharpen: bool = True, saturation: float = 1.0) -> np.ndarray:
+    """Tonal finishing: contrast stretch on L, optional re-toning, light unsharp mask.
+
+    The colorized variant only gets its saturation adjusted: DDColor's output already has the
+    restored tonal range, and stretching it crushed dark clothes into black.
+    """
     lab = to_lab(img)
+    if tone == "color":
+        lab[..., 1:] *= saturation
+        return from_lab(lab)
     L = lab[..., 0]
     lo, hi = np.percentile(L, [0.3, 99.7])
     if hi - lo > 1:
@@ -120,8 +127,6 @@ def finish(img: np.ndarray, tone: str, sharpen: bool = True) -> np.ndarray:
     elif tone == "sepia":
         lab[..., 1] = 2.0 + 6.0 * shade
         lab[..., 2] = 8.0 + 14.0 * shade
-    elif tone == "color":
-        lab[..., 1:] *= 1.08
     return from_lab(lab)
 
 
@@ -380,7 +385,7 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         if tone != "color":
             img = tone_match(img, orig_img)
         final = path.with_name(path.stem + "-final.jpg")
-        write_image(final, finish(img, tone, sharpen=not a.no_sharpen))
+        write_image(final, finish(img, tone, sharpen=not a.no_sharpen, saturation=a.saturation))
         print(f"  ✓ {final.name} (tone: {tone})")
 
     manifest = {k: v for k, v in vars(a).items() if k != "func"}
@@ -565,6 +570,8 @@ def main() -> int:
     r.add_argument("--seed", type=int, default=42)
     r.add_argument("--megapixels", type=float, default=1.0, help="generative working size (local backend)")
     r.add_argument("--colorize", action="store_true", help="add a DDColor colorized variant")
+    r.add_argument("--saturation", type=float, default=0.85,
+                   help="colorized variant: colour strength (1 = as DDColor makes it, 0 = grey)")
     r.add_argument("--tone", choices=["keep", "neutral", "sepia"], default="keep",
                    help="B/W variants: keep the print's tint, neutral grey, or sepia")
     r.add_argument("--no-sharpen", action="store_true")

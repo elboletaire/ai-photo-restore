@@ -34,7 +34,7 @@ class FakeBackend:
 
 def args(**kw):
     defaults = dict(fidelity=0.7, no_upscale=False, generative=True, prompt="p", seed=42, megapixels=1.0,
-                    colorize=True, tone="keep", no_sharpen=False, force=False)
+                    colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
     return argparse.Namespace(**{**defaults, **kw})
 
 

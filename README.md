@@ -57,7 +57,7 @@ uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --generative 
 uv run skills/restore-photos/scripts/restore.py run photo.jpg --colorize --tone neutral --backend fal
 ```
 
-`run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo and only rerun when their input or settings change, so retoning or rerunning is instant.
+`run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--saturation`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo and only rerun when their input or settings change, so retoning or rerunning is instant.
 
 ## Where it works
 
