@@ -10,3 +10,6 @@ restored*/
 *.webp
 *.bmp
 *.heic
+
+# Except the reference photos, published with permission (public domain).
+!examples/*.jpg
