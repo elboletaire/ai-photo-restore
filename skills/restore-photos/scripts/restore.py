@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import mimetypes
@@ -289,12 +290,26 @@ def collect_inputs(args: list[str]) -> list[Path]:
     return files
 
 
-def stage(target: Path, label: str, force: bool, produce) -> None:
-    if target.exists() and not force:
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def stage(target: Path, label: str, inputs: Path, settings: dict, force: bool, produce) -> None:
+    """Run an AI stage unless `target` was already made from the same input file and settings.
+
+    What each stage was made from is recorded in stages.json next to it, so changing --seed,
+    --fidelity, the backend, or recomputing an upstream stage reruns it automatically.
+    """
+    record = target.parent / "stages.json"
+    done = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
+    key = {**settings, "input": digest(inputs)}
+    if target.exists() and not force and done.get(target.name) == key:
         print(f"  = {label} (cached)")
         return
     t0 = time.time()
     target.write_bytes(produce())
+    done[target.name] = key
+    record.write_text(json.dumps(done, indent=2), encoding="utf-8")
     print(f"  ✓ {label} ({time.time() - t0:.1f}s)", flush=True)
 
 
@@ -303,25 +318,28 @@ def restore_one(src: Path, out_root: Path, backend, a) -> None:
     d.mkdir(parents=True, exist_ok=True)
     print(f"▶ {src.stem}  [{backend.name}]", flush=True)
     original = d / f"00-original{src.suffix.lower()}"
-    if not original.exists():
+    if not original.exists() or digest(original) != digest(src):
         shutil.copyfile(src, original)
 
     conservative = d / "10-conservative.png"
-    stage(conservative, "conservative (upscale + CodeFormer)", a.force,
+    stage(conservative, "conservative (upscale + CodeFormer)", original,
+          {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
           lambda: backend.conservative(original, a.fidelity, not a.no_upscale))
     variants = [(conservative, a.tone)]
 
     color_base = conservative
     if a.generative:
         generative = d / "20-generative.png"
-        stage(generative, "generative (Qwen-Image-Edit-2511)", a.force,
+        stage(generative, "generative (Qwen-Image-Edit-2511)", original,
+              {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels}, a.force,
               lambda: backend.generative(original, a.prompt, a.seed, a.megapixels))
         variants.append((generative, a.tone))
         color_base = generative
 
     if a.colorize:
         color = d / "30-color.png"
-        stage(color, "colorize (DDColor)", a.force, lambda: backend.colorize(color_base))
+        stage(color, "colorize (DDColor)", color_base, {"backend": backend.name}, a.force,
+              lambda: backend.colorize(color_base))
         variants.append((color, "color"))
 
     orig_img = read_image(original)

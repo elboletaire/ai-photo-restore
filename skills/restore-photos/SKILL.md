@@ -49,7 +49,7 @@ uv run <skill-dir>/scripts/restore.py run <files or folders> --out restored [--b
   [--generative] [--colorize] [--fidelity 0.7] [--tone keep|neutral|sepia] [--seed 42]
 ```
 
-AI stages are cached per photo. Changing tone/finish is instant (just rerun). To redo an AI stage, add `--force` or delete that stage file (e.g. `20-generative.png`). Try another `--seed` when a generative result is off.
+AI stages are cached per photo and rerun on their own when their input or settings change (`--seed`, `--fidelity`, `--prompt`, `--no-upscale`, backend). Changing tone/finish is instant (just rerun). Try another `--seed` when a generative result is off. `--force` recomputes every AI stage; to redo just one, delete its file (e.g. `20-generative.png`).
 `--prompt "..."` overrides the generative instruction for a specific photo (e.g. "also remove the handwritten date in the corner"). Keep the "keep the exact same people, faces, expressions…" part.
 
 ## 4. Review before reporting

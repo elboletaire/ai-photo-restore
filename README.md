@@ -57,7 +57,7 @@ uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --generative 
 uv run skills/restore-photos/scripts/restore.py run photo.jpg --colorize --tone neutral --backend fal
 ```
 
-`run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo, so retoning or rerunning is instant.
+`run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo and only rerun when their input or settings change, so retoning or rerunning is instant.
 
 ## Where it works
 
@@ -75,11 +75,21 @@ skills/restore-photos/
   scripts/restore.py     the whole pipeline (run / doctor / setup-local / sheet)
   workflows/*.json       ComfyUI API workflows. Open them in ComfyUI to tweak them, and keep the node titles.
   references/            backend setup guides
+examples/                reference photos with different kinds of damage
+tests/                   pytest suite (fake backend)
 ```
 
 ## Performance
 
 On an RTX 5080: conservative 4–10 s, generative 15–40 s (the first run loads ~30 GB of models), colorization 5–15 s per photo.
+
+## Development
+
+```bash
+uv run --with pytest --with numpy --with opencv-python-headless --with requests pytest
+```
+
+The tests use a fake backend, so they need neither ComfyUI nor fal. [examples/](examples) has real damaged photos to try every pipeline on.
 
 ## License
 
