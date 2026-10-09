@@ -129,26 +129,30 @@ def finish(img: np.ndarray, tone: str, sharpen: bool = True) -> np.ndarray:
 
 class ComfyBackend:
     name = "local"
-    NODES = ["FaceRestoreCFWithModel", "DDColor_Colorize", "TextEncodeQwenImageEditPlus", "ImageUpscaleWithModel"]
 
     def __init__(self, url: str | None = None):
         self.url = (url or os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
         self.client_id = uuid.uuid4().hex
 
-    def check(self) -> list[str]:
+    def check(self, stages: list[str]) -> list[str]:
+        """Problems that would stop the workflows of `stages` from running: missing nodes or models."""
         try:
             info = requests.get(f"{self.url}/object_info", timeout=10).json()
         except requests.RequestException:
             return [f"ComfyUI not reachable at {self.url} (start it, or set COMFY_URL)"]
-        problems = [f"missing ComfyUI node {n} (run setup-local)" for n in self.NODES if n not in info]
-        for wf in ("conservative", "generative", "colorize"):
+        problems = []
+        for wf in stages:
             for node in load_workflow(wf).values():
-                spec = info.get(node["class_type"], {}).get("input", {}).get("required", {})
+                cls = node["class_type"]
+                if cls not in info:
+                    problems.append(f"{wf}: missing ComfyUI node {cls} (run setup-local, then restart ComfyUI)")
+                    continue
+                inputs = info[cls].get("input", {})
+                spec = {**inputs.get("optional", {}), **inputs.get("required", {})}
                 for key, value in node["inputs"].items():
-                    options = spec.get(key, [None])[0]
-                    if isinstance(options, list) and isinstance(value, str) and value not in options \
-                            and node["class_type"] != "LoadImage":
-                        problems.append(f"{wf}: {node['class_type']}.{key} = {value} not installed")
+                    options = combo_options(spec.get(key))
+                    if options is not None and isinstance(value, str) and value not in options and cls != "LoadImage":
+                        problems.append(f"{wf}: {cls}.{key} = {value} not installed (run setup-local)")
         return problems
 
     def _upload(self, path: Path) -> str:
@@ -210,7 +214,7 @@ class FalBackend:
     def __init__(self):
         self.key = os.environ.get("FAL_KEY", "")
 
-    def check(self) -> list[str]:
+    def check(self, stages: list[str]) -> list[str]:
         return [] if self.key else ["FAL_KEY is not set (create one at https://fal.ai/dashboard/keys)"]
 
     def _call(self, endpoint: str, payload: dict) -> bytes:
@@ -242,6 +246,17 @@ class FalBackend:
 
     def colorize(self, path: Path) -> bytes:
         return self._call("fal-ai/ddcolor", {"image_url": self._data_uri(path)})
+
+
+def combo_options(spec) -> list | None:
+    """The choices of a ComfyUI dropdown input, in the old ([...],) or newer ("COMBO", {"options": [...]}) form."""
+    if not spec:
+        return None
+    if isinstance(spec[0], list):
+        return spec[0]
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        return spec[1].get("options")
+    return None
 
 
 def make_backend(name: str):
@@ -372,7 +387,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 def cmd_run(a) -> int:
     backend = make_backend(a.backend)
-    problems = backend.check()
+    stages = ["conservative"] + ["generative"] * a.generative + ["colorize"] * a.colorize
+    problems = backend.check(stages)
     if problems:
         print("backend not ready:\n  - " + "\n  - ".join(problems), file=sys.stderr)
         return 2
@@ -390,12 +406,20 @@ def cmd_run(a) -> int:
 
 
 def cmd_doctor(a) -> int:
-    problems = make_backend(a.backend).check()
-    for p in problems:
-        print(f"✗ {p}")
-    if not problems:
-        print(f"✓ backend '{a.backend}' ready")
-    return 1 if problems else 0
+    backend = make_backend(a.backend)
+    failed = []
+    for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("colorize", " (--colorize)")):
+        problems = backend.check([name])
+        print(f"{'✗' if problems else '✓'} {name}{flag}")
+        for p in problems:
+            print(f"    {p}")
+        if problems:
+            failed.append(name)
+    if "conservative" in failed:
+        print(f"backend '{a.backend}' not ready")
+        return 1
+    print(f"backend '{a.backend}' ready" + (f", without {' and '.join(failed)}" if failed else ""))
+    return 0
 
 
 # ---------------------------------------------------------------- local setup
