@@ -156,9 +156,12 @@ class ComfyBackend:
         return problems
 
     def _upload(self, path: Path) -> str:
+        # Named after the content: every stage file is called 00-original.jpg, 10-conservative.png...,
+        # so a fixed name would let two runs at once overwrite each other's input.
+        name = f"{digest(path)}{path.suffix.lower()}"
         with open(path, "rb") as f:
-            r = requests.post(f"{self.url}/upload/image", files={"image": (path.name, f)},
-                              data={"overwrite": "true"}, timeout=120)
+            r = requests.post(f"{self.url}/upload/image", files={"image": (name, f)},
+                              data={"overwrite": "true", "subfolder": "photo-restore"}, timeout=120)
         r.raise_for_status()
         d = r.json()
         return f"{d['subfolder']}/{d['name']}" if d.get("subfolder") else d["name"]
