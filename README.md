@@ -2,9 +2,9 @@
 
 # photo-restore
 
-*Restore, repair and colorize old family photographs with Claude Code*
+*An agent skill to restore, repair and colorize old family photographs*
 
-[![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
+[![Agent Skill](https://img.shields.io/badge/Agent-Skill-d97757?style=flat-square)](https://skills.sh)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab?style=flat-square)](https://www.python.org)
 [![uv](https://img.shields.io/badge/runs_with-uv-de5fe9?style=flat-square)](https://docs.astral.sh/uv/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
@@ -13,7 +13,7 @@
 
 </div>
 
-A [Claude Code](https://claude.com/claude-code) plugin that brings old photographs back: it fills holes and peeled emulsion, removes stains and scratches, sharpens faces, upscales, removes worn borders and oval mounts, and optionally colorizes. Claude looks at each photo first, picks the settings, runs the pipeline, and compares every result with the original before recommending one.
+An agent skill that brings old photographs back: it fills holes and peeled emulsion, removes stains and scratches, sharpens faces, upscales, removes worn borders and oval mounts, and optionally colorizes. Your coding agent (Claude Code, Codex, GitHub Copilot, OpenCode and others) looks at each photo first, picks the settings, runs the pipeline, and compares every result with the original before recommending one. The pipeline is a plain Python script, so you can also run it without an agent.
 
 It runs **locally** on your GPU through [ComfyUI](https://github.com/Comfy-Org/ComfyUI), or **in the cloud** through [fal.ai](https://fal.ai). Your originals are never modified.
 
@@ -57,16 +57,24 @@ Black-and-white and sepia variants keep the print's own tint: AI models invent c
 
 ## Installation
 
+Install the skill for your agent with [skills](https://skills.sh):
+
+```bash
+npx skills add https://github.com/elboletaire/ai-photo-skills --skill restore-photos
+```
+
+It works with any agent that supports [Agent Skills](https://agentskills.io) (Claude Code, Codex, GitHub Copilot, OpenCode, Amp, ...). In Claude Code you can also install it as a plugin:
+
 ```
 /plugin marketplace add elboletaire/ai-photo-skills
 /plugin install photo-restore@photo-restore
 ```
 
-The only hard requirement is [uv](https://docs.astral.sh/uv/getting-started/installation/), which runs the pipeline script and installs its Python dependencies. It works on Linux, macOS, Windows and WSL. Then pick a backend.
+The only hard requirement is [uv](https://docs.astral.sh/uv/getting-started/installation/), which runs the pipeline script and installs its Python dependencies. It works on Linux, macOS, Windows and WSL. Your agent needs to be able to run shell commands; to review the results it also has to be able to look at images. Then pick a backend.
 
 ### Local (ComfyUI)
 
-Ask Claude to *"set up the local photo restoration backend"*. It follows [setup-local.md](skills/restore-photos/references/setup-local.md): installs ComfyUI with [comfy-cli](https://github.com/Comfy-Org/comfy-cli) if needed (or reuses yours: portable, Desktop or a git checkout), adds two custom nodes and downloads the models.
+Ask your agent to *"set up the local photo restoration backend"*. It follows [setup-local.md](skills/restore-photos/references/setup-local.md): installs ComfyUI with [comfy-cli](https://github.com/Comfy-Org/comfy-cli) if needed (or reuses yours: portable, Desktop or a git checkout), adds two custom nodes and downloads the models.
 
 - All variants: an NVIDIA GPU with 16 GB of VRAM and 32 GB of RAM is comfortable; about 32 GB of disk.
 - Conservative and colorized only: about 1.5 GB of models, runs on most GPUs and on Apple Silicon.
@@ -84,11 +92,11 @@ No GPU needed: roughly $0.005 per photo for the conservative variant and $0.04 w
 
 ## Usage
 
-Just ask Claude:
+Just ask your agent:
 
 > Restore the photos in `~/Pictures/grandparents`, they're quite damaged. Remove the borders and colorize the wedding one too.
 
-Claude checks the backend, looks at each photo, runs the right variants, reviews the results (and retries bad fills on its own), then points you to the comparison page with a recommendation per photo.
+The agent checks the backend, looks at each photo, runs the right variants, reviews the results (and retries bad fills on its own), then points you to the comparison page with a recommendation per photo.
 
 Or run the script yourself:
 
@@ -131,9 +139,9 @@ Turbo is meant for smaller GPUs (roughly 10–12 GB of VRAM, untested below that
 ## Project layout
 
 ```
-.claude-plugin/          plugin and marketplace manifests
+.claude-plugin/          Claude Code plugin and marketplace manifests
 skills/restore-photos/
-  SKILL.md               how Claude chooses settings, reviews results and retries
+  SKILL.md               how the agent chooses settings, reviews results and retries
   scripts/restore.py     the whole pipeline (run / doctor / setup-local / sheet)
   workflows/*.json       ComfyUI API workflows (open them in ComfyUI to tweak; keep the node titles)
   references/            backend setup guides
