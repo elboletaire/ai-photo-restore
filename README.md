@@ -60,13 +60,13 @@ Black-and-white and sepia variants keep the print's own tint: AI models invent c
 Install the skill for your agent with [skills](https://skills.sh):
 
 ```bash
-npx skills add https://github.com/elboletaire/ai-photo-skills --skill restore-photos
+npx skills add https://github.com/elboletaire/ai-photo-restore --skill restore-photos
 ```
 
 It works with any agent that supports [Agent Skills](https://agentskills.io) (Claude Code, Codex, GitHub Copilot, OpenCode, Amp, ...). In Claude Code you can also install it as a plugin:
 
 ```
-/plugin marketplace add elboletaire/ai-photo-skills
+/plugin marketplace add elboletaire/ai-photo-restore
 /plugin install photo-restore@photo-restore
 ```
 
