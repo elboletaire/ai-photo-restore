@@ -835,11 +835,18 @@ def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) 
     """Fill the picture's missing edges, corners and mount, inside the whole rectangle `box`.
 
     Each separate hole is generated from a padded crop around it, so the model works near native resolution.
-    Crops that overlap are generated together.
+    Crops that overlap are generated together. The model inpaints a pre-filled copy of the rectangle (the mount
+    replaced by a continuation of the picture, see prefill): shown the oval's blurred edge and the cream mount, it
+    continued the blur and drew a cut-off hand as a smear; shown a backdrop, it draws the hand. The fill is then
+    matched to the kept picture's lightness along its boundary and ramped in; outside it the picture is kept bit
+    for bit.
     """
     x0, y0, x1, y1 = box
-    img = read_image(base)[y0:y1, x0:x1]
-    m = fill[y0:y1, x0:x1]
+    whole = read_image(base)
+    original, m, long = whole[y0:y1, x0:x1], fill[y0:y1, x0:x1], max(whole.shape[:2])
+    if not m.any():
+        return cv2.imencode(".png", original)[1].tobytes()
+    img = prefill(original, m)
     todo = m > 0
     h, w = img.shape[:2]
     n, parts = cv2.connectedComponents(todo.astype(np.uint8))
@@ -858,15 +865,12 @@ def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) 
         img = inpaint(backend, img, mask, a.frame_prompt, a, box=bx, outward=False, seed=seed,
                       quality=a.frame_quality)
         todo[bx[1]:bx[3], bx[0]:bx[2]] = False
-    # The model sprinkles bright specks over the smooth dark areas it generates: median them out (fill only).
-    med = cv2.medianBlur(img, 5)
-    speck = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & (m > 0)
-    img[speck] = med[speck]
-    return cv2.imencode(".png", img)[1].tobytes()
+    gen = tone_match(match_luminance(img, original, m, max(8, round(FILL_BAND * long)), inpainted=True), original)
+    return cv2.imencode(".png", blend_fill(original, gen, m, long))[1].tobytes()
 
 
-TURBO_BAND = 0.02  # share of the long side: the band of kept picture along the fill where the Turbo edit is matched to it
-TURBO_RAMP = 0.01  # share of the long side: the Turbo fill ramps in from the kept picture over this width
+FILL_BAND = 0.02  # share of the long side: the band along the fill's boundary where a fill is matched to the kept picture
+FILL_RAMP = 0.01  # share of the long side: a fill ramps in from the kept picture over this width
 
 
 def prefill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -898,18 +902,41 @@ def smooth_field(values: np.ndarray, weight: np.ndarray, sigma: float) -> np.nda
     return out
 
 
-def match_luminance(gen: np.ndarray, base: np.ndarray, fill: np.ndarray, band: int) -> np.ndarray:
-    """`gen`, a whole-image edit of `base`, with its lightness shifted by a smooth field so that it continues the
-    kept picture across the fill's boundary: the model renders the backdrop a few L lighter or darker than the
-    print, and the step along the oval reads as a ring. The shift is measured where both show the same thing, the
-    band of kept picture `band` px inside the fill's boundary, and extrapolated into the fill."""
+def match_luminance(gen: np.ndarray, base: np.ndarray, fill: np.ndarray, band: int, inpainted: bool = False) -> np.ndarray:
+    """`gen` with its lightness shifted by a smooth field so that it continues the kept picture across the fill's
+    boundary: the model renders the backdrop a few L lighter or darker than the print, and the step along the oval
+    reads as a ring.
+
+    For a whole-image edit of `base` the shift is measured where both show the same thing, the band of kept picture
+    `band` px inside the fill's boundary, and extrapolated into the fill. For a masked inpaint (`inpainted`), whose
+    kept picture is the base's own, it is the base's band inside the boundary against the gen's band inside the fill.
+    """
     lab = to_lab(gen)
     kept = (fill == 0).astype(np.uint8)
     inward = cv2.distanceTransform(kept, cv2.DIST_L2, 5)
     where = ((inward > 0) & (inward <= band)).astype(np.float32)
-    shift = smooth_field(to_lab(base)[..., 0] - lab[..., 0], where, float(band))
+    if inpainted:
+        outward = cv2.distanceTransform((fill > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        where_fill = ((outward > 0) & (outward <= band)).astype(np.float32)
+        shift = smooth_field(to_lab(base)[..., 0], where, float(band)) - smooth_field(lab[..., 0], where_fill, float(band))
+        shift = smooth_field(shift, np.maximum(where, where_fill), float(band))
+    else:
+        shift = smooth_field(to_lab(base)[..., 0] - lab[..., 0], where, float(band))
     lab[..., 0] = np.clip(lab[..., 0] + shift, 0, 100)
     return from_lab(lab)
+
+
+def blend_fill(img: np.ndarray, gen: np.ndarray, fill: np.ndarray, long: int) -> np.ndarray:
+    """`img` with the fill taken from `gen`, ramping in from the kept picture; outside the fill `img` is kept bit for
+    bit. The model sprinkles bright specks over the smooth dark areas it generates: they are medianed out (fill only)."""
+    m = fill > 0
+    dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = (np.clip(dist / max(4, round(FILL_RAMP * long)), 0, 1) * m)[..., None]
+    out = (img * (1 - alpha) + gen * alpha + 0.5).astype(np.uint8)
+    med = cv2.medianBlur(out, 5)
+    speck = (cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & m
+    out[speck] = med[speck]
+    return out
 
 
 def turbo_full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) -> bytes:
@@ -931,14 +958,8 @@ def turbo_full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed:
         write_image(pre_path, pre)
         gen = cv2.imdecode(np.frombuffer(backend.generative(pre_path, a.frame_prompt, seed, a.megapixels), np.uint8),
                            cv2.IMREAD_COLOR)
-    gen = tone_match(match_luminance(align_to(gen, pre), img, m, max(8, round(TURBO_BAND * long))), img)
-    dist = cv2.distanceTransform((m > 0).astype(np.uint8), cv2.DIST_L2, 5)
-    alpha = (np.clip(dist / max(4, round(TURBO_RAMP * long)), 0, 1) * (m > 0))[..., None]
-    out = (img * (1 - alpha) + gen * alpha + 0.5).astype(np.uint8)
-    med = cv2.medianBlur(out, 5)  # the same speck filter as full_frame
-    speck = (cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & (m > 0)
-    out[speck] = med[speck]
-    return cv2.imencode(".png", out)[1].tobytes()
+    gen = tone_match(match_luminance(align_to(gen, pre), img, m, max(8, round(FILL_BAND * long))), img)
+    return cv2.imencode(".png", blend_fill(img, gen, m, long))[1].tobytes()
 
 
 def frame_overlay(img: np.ndarray, box: tuple, fill: np.ndarray) -> np.ndarray:
@@ -1052,16 +1073,17 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
             elif frame_seed not in seeds:
                 seeds.append(frame_seed)
             candidates = []
-            # Turbo edits the whole rectangle from a pre-filled copy (its masked inpaint copies the mount it sees);
-            # 2511 inpaints the fill in place. The key tells them apart so an earlier Turbo fill is not reused.
+            # Both start from a pre-filled copy of the rectangle (the mount painted over): 2511 inpaints the fill in
+            # it, Turbo (whose masked inpaint copies the mount it sees) edits the whole rectangle and only the fill is
+            # taken. The key tells them apart, and from the earlier plain inpaint, so no older fill is reused.
             turbo = a.qwen_model == "turbo"
             fill_frame = turbo_full_frame if turbo else full_frame
-            how = "edits the pre-filled rectangle" if turbo else "fills the rectangle"
+            how = "edits the pre-filled rectangle" if turbo else "inpaints the pre-filled rectangle"
             for seed in seeds:
                 raw = d / f"28-full-frame-raw-s{seed}.png"
                 stage(raw, f"full frame, seed {seed} ({QWEN_NAMES[a.qwen_model]}, {how})", [base, frame_mask],
                       {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
-                       "rect": box, "quality": a.frame_quality, **qwen_key(a), **({"fill": "prefilled-edit"} if turbo else {})},
+                       "rect": box, "quality": a.frame_quality, **qwen_key(a), "fill": "prefilled-edit" if turbo else "prefilled"},
                       a.force, lambda seed=seed: fill_frame(backend, base, box, fill, a, seed))
                 candidates.append((seed, raw))
             if len(candidates) > 1:

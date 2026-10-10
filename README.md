@@ -128,7 +128,7 @@ The generative, repaired and full-frame variants use an image-editing model. Two
 | Size on disk | ~30 GB | ~14 GB |
 | Speed (RTX 5080) | 25–40 s per generative image | about twice as fast |
 | Generative | crisp, but redraws faces more | keeps faces and composition closer to the original |
-| Repair and full frame | best results | weaker repair; full frame works, hands vary more by seed |
+| Repair and full frame | best results; vignette fills inpaint a copy with the mount painted over, so cut-off hands come out defined | weaker repair; full frame works, hands vary more by seed |
 | Licence | Apache-2.0 | Qwen Research License, non-commercial |
 
 Turbo is meant for smaller GPUs (roughly 10–12 GB of VRAM, untested below that) and for faster runs. Install its files with `setup-local --turbo`.

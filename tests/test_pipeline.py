@@ -679,27 +679,36 @@ def test_fal_refuses_the_turbo_model(monkeypatch):
 
 
 
-def test_the_default_model_still_inpaints_the_frame_in_place_with_the_same_call_and_key(tmp_path):
+def test_the_default_model_inpaints_a_prefilled_rectangle_and_keeps_the_picture(tmp_path):
+    img = vignette_card()
     src = tmp_path / "card.png"
-    restore.write_image(src, vignette_card())
+    restore.write_image(src, img)
     b = FakeBackend()
     seen = []
 
     def repair(path, mask, prompt, seed, megapixels, quality="fast"):
-        img = restore.read_image(path)
-        seen.append((prompt, seed, megapixels, quality, restore.read_mask(mask, img.shape[:2]).any()))
+        crop = restore.read_image(path)
+        seen.append((prompt, seed, megapixels, quality, restore.read_mask(mask, crop.shape[:2]), crop))
         return b._echo("repair", path)
 
     b.repair = repair
     b.generative = lambda path, prompt, *a: seen.append(("generative", prompt)) or b._echo("generative", path)
     restore.restore_one(src, tmp_path / "out", b, args(generative=False, full_frame=True, colorize=False))
     assert b.calls == ["conservative", "generative", "repair", "conservative"]
-    assert seen == [("generative", "p"), ("f", 42, 1.0, "fast", True)]  # the fill is a masked repair, not an edit
+    assert seen[0] == ("generative", "p")
+    prompt, seed, megapixels, quality, mask, crop = seen[1]  # the fill is still a masked repair, not a whole edit
+    assert (prompt, seed, megapixels, quality) == ("f", 42, 1.0, "fast") and mask.any()
+    mount = np.abs(crop.astype(int) - [200, 215, 225]).sum(axis=2) < 15
+    assert not (mount & (mask > 0)).any()  # the model is shown a pre-filled rectangle: no cream mount in the fill
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    base, m = img[y0:y1, x0:x1], fill[y0:y1, x0:x1] > 0
+    raw = restore.read_image(tmp_path / "out" / "card" / "28-full-frame-raw.png")
+    assert np.array_equal(raw[~m], base[~m])  # the kept picture is bit for bit the original's
     keys = json.loads((tmp_path / "out" / "card" / "stages.json").read_text(encoding="utf-8"))
     key = keys["28-full-frame-raw-s42.png"]
-    box, _ = restore.picture_region(restore.read_image(src))
     assert {k: v for k, v in key.items() if k != "inputs"} == {"backend": "fake", "prompt": "f", "seed": 42,
-                                                                "megapixels": 1.0, "rect": list(box), "quality": "fast"}
+                                                                "megapixels": 1.0, "rect": [x0, y0, x1, y1], "quality": "fast",
+                                                                "fill": "prefilled"}  # an earlier plain inpaint is not reused
     assert len(key["inputs"]) == 2  # the base and the frame mask
     # and the graph it sends is still the 2511 repair graph, untouched
     cb, sent = captured_backend("2511")
@@ -841,3 +850,25 @@ def test_clean_print_softens_the_grain_and_stretches_the_lightness():
     assert fine(out) < 0.5 * fine(img)  # the grain is softened
     L = restore.to_lab(out)[..., 0]
     assert np.percentile(L, 0.3) < 2 and np.percentile(L, 99.7) > 98  # and the range is stretched to the full scale
+
+
+def test_the_default_fill_is_matched_to_the_kept_picture_along_its_boundary(tmp_path):
+    img = vignette_card()
+    src = tmp_path / "card.png"
+    restore.write_image(src, img)
+    b = FakeBackend()
+
+    def repair(path, mask, prompt, seed, megapixels, quality="fast"):  # the model renders everything 12 lighter
+        out = np.clip(restore.read_image(path).astype(int) + 12, 0, 255).astype(np.uint8)
+        return png(out)
+
+    b.repair = repair
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, full_frame=True, colorize=False))
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    base, m = img[y0:y1, x0:x1], fill[y0:y1, x0:x1] > 0
+    raw = restore.read_image(tmp_path / "out" / "card" / "28-full-frame-raw.png")
+    L = restore.to_lab(raw)[..., 0]
+    dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 5)
+    near = (dist > 0.01 * 600 + 2) & (dist < 0.02 * 600)  # past the ramp, near the boundary
+    assert abs(np.median(L[near]) - np.median(restore.to_lab(base)[..., 0][~m])) < 1.0
+    assert not np.array_equal(raw[m], base[m])
