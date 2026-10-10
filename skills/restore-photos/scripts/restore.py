@@ -212,9 +212,10 @@ PICTURE_DISTANCE = 12  # Lab distance from the mount colour that separates the p
 SOLID_PICTURE = 0.95  # a picture this solid (an oval, a rectangle) is a vignette or a mount's picture
 FRAME_REACH = 0.06  # share of the long side the frame may come in from the card's edge
 EDGE_BAND = 0.03  # share of the long side, along each edge of a card on a scanner bed, that is regenerated
-CORNER_SQUARE = 0.08  # share of the long side, the square in each corner that is regenerated (rounded, chipped)
+CORNER_SQUARE = 0.05  # share of the long side, the square in each corner taken from the generative variant
 MIN_PICTURE = 0.1  # the share of the card a picture in a vignette or on a mount covers, at least
 VIGNETTE_COVER = 0.8  # below this share of the card, the picture sits in a vignette or a mount
+VIGNETTE_EDGE = 0.015  # share of the long side, the outermost sliver of a vignette's frame, regenerated too
 VIGNETTE_GROW = 0.025  # share of the long side the fill grows into a curved vignette, its dark shadow ring
 FILLED_BOX = 0.97  # a picture this full of its bounding box is a rectangle: nothing to fill
 
@@ -230,25 +231,38 @@ def reach_depth(lines: np.ndarray) -> int:
     return int(np.percentile(extent, 50))
 
 
-def edge_band(box: tuple, shape: tuple[int, int], long: int) -> np.ndarray:
-    """A fixed band along the four edges of the rectangle `box`, plus a square in each corner (0/1).
-
-    The worn edge of a card and its rounded or chipped corners lie within these, whatever their colour.
-    """
+def corner_squares(box: tuple, shape: tuple[int, int], long: int) -> np.ndarray:
+    """A square in each corner of the rectangle `box` (0/1), the size of the rounded and chipped corners."""
     x0, y0, x1, y1 = box
-    band, corner = round(EDGE_BAND * long), round(CORNER_SQUARE * long)
-    rect = np.zeros(shape, np.uint8)
-    rect[y0:y1, x0:x1] = 1
-    inner = np.zeros(shape, np.uint8)
-    inner[y0 + band:max(y0 + band, y1 - band), x0 + band:max(x0 + band, x1 - band)] = 1
+    corner = round(CORNER_SQUARE * long)
     squares = np.zeros(shape, np.uint8)
     for cx, cy in [(x0, y0), (x1 - corner, y0), (x0, y1 - corner), (x1 - corner, y1 - corner)]:
         squares[max(0, cy):cy + corner, max(0, cx):cx + corner] = 1
-    return (((rect & (1 - inner)) | squares) & rect).astype(np.uint8)
+    return squares
+
+
+def generative_fill(base: np.ndarray, gen: np.ndarray, corners: np.ndarray, bare: np.ndarray, corner: int) -> np.ndarray:
+    """Fill the corners and the missing paper from the generative variant, aligned and tone-matched to the print.
+
+    The corners ramp in from the generative (0 at their inner edge, 1 deep in the corner); bare paper takes it fully.
+    Outside the fill the base is kept bit for bit. The model is not called: the generative variant is already there.
+    """
+    g = tone_match(gen, base)
+    dist = cv2.distanceTransform(corners.astype(np.uint8), cv2.DIST_L2, 3)
+    alpha = np.maximum(np.clip(dist / (0.6 * corner), 0, 1), bare.astype(np.float32))
+    alpha = (alpha * ((corners | bare) > 0))[..., None]
+    return (base * (1 - alpha) + g * alpha + 0.5).astype(np.uint8)
 
 
 def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = None, fill: np.ndarray | None = None):
-    """The rectangle a --full-frame photo should fill, and the pixels inside it to generate (0/255).
+    """The rectangle a --full-frame photo should fill, and the pixels inside it to generate (0/255)."""
+    box, fill, _ = frame_region(img, rect, fill)
+    return box, fill
+
+
+def frame_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = None, fill: np.ndarray | None = None):
+    """Like picture_region, and how the fill is made: "generative" (the corners come from the generative variant,
+    for a card on a scanner bed that runs to the edges) or "inpaint" (the model fills it).
 
     A picture in an oval vignette, or on a mount, keeps only its own pixels: the vignette and the mount are filled.
     A picture running to the card's edges keeps the card minus its bare paper, and the rectangle comes in past the
@@ -289,15 +303,15 @@ def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = Non
     else:
         # The outline: where the bed bites into the card's bounding box, the rectangle comes in past it.
         reach = max(3, round(FRAME_REACH * long))
-        margin = round(0.005 * long) if outlined else 0
         bed = ~card
-        depth = [
-            reach_depth(bed[cy0:cy1, cx0:cx0 + reach]),
-            reach_depth(bed[cy0:cy1, cx1 - reach:cx1][:, ::-1]),
-            reach_depth(bed[cy0:cy0 + reach, cx0:cx1].T),
-            reach_depth(bed[cy1 - reach:cy1, cx0:cx1][::-1].T),
-        ]
-        il, ir, it, ib = (min(reach, v + margin) for v in depth)
+        strips = [bed[cy0:cy1, cx0:cx0 + reach], bed[cy0:cy1, cx1 - reach:cx1][:, ::-1],
+                  bed[cy0:cy0 + reach, cx0:cx1].T, bed[cy1 - reach:cy1, cx0:cx1][::-1].T]
+        # Only a side the scanner bed touches has a worn rim to crop: the other sides are the image's own edges.
+        on_bed = [outlined and strip.any() for strip in strips]
+        margin = round(0.005 * long)
+        crop = round(EDGE_BAND * long)  # the worn rim is cropped, not generated
+        il, ir, it, ib = (min(reach, reach_depth(strip) + margin) + crop if b else 0
+                          for strip, b in zip(strips, on_bed))
         keep = card
         box = (cx0 + il, cy0 + it, cx1 - ir, cy1 - ib)
         curved = False
@@ -312,7 +326,7 @@ def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = Non
     inside = np.zeros((h, w), np.uint8)
     inside[y0:y1, x0:x1] = 1
     if fill is not None:  # --frame-mask: the user's own mask
-        return (x0, y0, x1, y1), ((fill > 0).astype(np.uint8) * inside) * 255
+        return (x0, y0, x1, y1), ((fill > 0).astype(np.uint8) * inside) * 255, "inpaint"
     if vignette and curved:  # the vignette's soft edge, its dark shadow ring included, is grown into
         grow = round(long * VIGNETTE_GROW)
     elif vignette:
@@ -322,9 +336,15 @@ def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = Non
     outside = (~keep).astype(np.uint8)
     if grow:
         outside = cv2.dilate(outside, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
-    if outlined and not vignette:  # a card on a scanner bed: its worn edge and corners are regenerated too
-        outside = np.maximum(outside, edge_band((x0, y0, x1, y1), (h, w), long))
-    return (x0, y0, x1, y1), (outside & inside) * 255
+    if outlined and not vignette:  # a card on a scanner bed: its corners come from the generative variant
+        corners = corner_squares((x0, y0, x1, y1), (h, w), long)
+        return (x0, y0, x1, y1), (np.maximum(outside, corners) & inside) * 255, "generative"
+    if vignette and curved:  # the outermost sliver of an oval's rectangle too: the model would continue the mount's edge
+        r = round(VIGNETTE_EDGE * long)
+        sliver = inside.copy()
+        sliver[y0 + r:max(y0 + r, y1 - r), x0 + r:max(x0 + r, x1 - r)] = 0
+        outside = np.maximum(outside, sliver)
+    return (x0, y0, x1, y1), (outside & inside) * 255, "inpaint"
 
 
 def damage_mask(original: np.ndarray, generative: np.ndarray, threshold: float = 15) -> np.ndarray:
@@ -676,6 +696,24 @@ def candidate_sheet(candidates: list[tuple[int, Path]], fill: np.ndarray, out: P
     write_image(out, np.hstack(tiles[:-1]))
 
 
+def generative_frame(base_img: np.ndarray, gen_img: np.ndarray, box: tuple, fill: np.ndarray, a) -> bytes:
+    """The rectangle `box` with its corners and missing paper taken from the aligned generative variant."""
+    x0, y0, x1, y1 = box
+    long = max(base_img.shape[:2])
+    corners = corner_squares(box, base_img.shape[:2], long)[y0:y1, x0:x1] > 0
+    f = fill[y0:y1, x0:x1] > 0
+    # Bare bed (and its antialiased rim) takes the generative fully, corners included: a ramp there leaves a seam.
+    bed = (scanner_lid(base_img) > 0)[y0:y1, x0:x1].astype(np.uint8)
+    bare = (cv2.dilate(bed, np.ones((5, 5), np.uint8)) > 0) & f
+    out = generative_fill(base_img[y0:y1, x0:x1], gen_img[y0:y1, x0:x1], corners, bare,
+                          round(CORNER_SQUARE * long))
+    # The same speck filter as the model fills: bright specks on the smooth dark areas (fill only).
+    med = cv2.medianBlur(out, 5)
+    speck = (cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & f
+    out[speck] = med[speck]
+    return cv2.imencode(".png", out)[1].tobytes()
+
+
 def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) -> bytes:
     """Fill the picture's missing edges, corners and mount, inside the whole rectangle `box`.
 
@@ -747,11 +785,12 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
     variants = [(conservative, a.tone)]
 
     color_base = conservative
-    if a.generative or a.repair:  # the repair finds the damage by comparing with the generative variant
+    if a.generative or a.repair or a.full_frame:  # the repair finds the damage, a full frame takes its corners
         generative = d / "20-generative.png"
         stage(generative, "generative (Qwen-Image-Edit-2511)", [original],
               {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels}, a.force,
               lambda: backend.generative(original, a.prompt, a.seed, a.megapixels))
+    if a.generative or a.repair:
         variants.append((generative, a.tone))
         color_base = generative
 
@@ -781,7 +820,7 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         base = d / "26-repaired-raw.png" if a.repair else original
         base_img = read_image(base)
         user_fill = read_mask(Path(a.frame_mask).expanduser(), base_img.shape[:2]) if a.frame_mask else None
-        box, fill = picture_region(base_img, a.frame, user_fill)
+        box, fill, mode = frame_region(base_img, a.frame, user_fill)
         write_image(d / "28-frame-overlay.jpg", frame_overlay(base_img, box, fill))
         x0, y0, x1, y1 = box  # the original in the same rectangle: the "before" of the full-frame comparisons
         write_image(d / "28-original-frame.jpg", read_image(original)[y0:y1, x0:x1])
@@ -794,25 +833,39 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
             print(f"  ! the frame keeps only {kept:.0%} of the photo: check 28-frame-overlay.jpg")
         frame_mask = d / "28-frame-mask.png"  # an input of the stage, so a change of detection reruns it
         write_image(frame_mask, fill)
-        # Candidates are the seeds from --seed on; --frame-seed picks one (it is generated if it is not one of them).
-        seeds = list(range(a.seed, a.seed + a.frame_candidates))
-        if frame_seed not in seeds:
-            seeds.append(frame_seed)
-        candidates = []
-        for seed in seeds:
-            raw = d / f"28-full-frame-raw-s{seed}.png"
-            stage(raw, f"full frame, seed {seed} (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
-                  {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
-                   "rect": box, "quality": a.frame_quality}, a.force,
-                  lambda seed=seed: full_frame(backend, base, box, fill, a, seed))
-            candidates.append((seed, raw))
-        if len(candidates) > 1:
-            candidate_sheet([(seed, raw) for seed, raw in candidates if seed in seeds[:a.frame_candidates]],
-                            fill[box[1]:box[3], box[0]:box[2]], d / "28-full-frame-candidates.jpg")
-        chosen = d / f"28-full-frame-raw-s{frame_seed}.png"
-        frame_raw = d / "28-full-frame-raw.png"  # the chosen candidate, on to the upscale
-        stage(frame_raw, "full frame: chosen candidate", [chosen], {"seed": frame_seed}, a.force,
-              lambda: chosen.read_bytes())
+        frame_raw = d / "28-full-frame-raw.png"
+        sheet = d / "28-full-frame-candidates.jpg"
+        sheet.unlink(missing_ok=True)  # a sheet from an earlier run with more candidates is stale
+        if mode == "generative":
+            # A card on a scanner bed: the corners come from the generative variant, aligned to the base. No model
+            # call, so no candidates.
+            if a.frame_candidates > 1 or a.frame_seed is not None:
+                print("  · corners come from the generative variant: --frame-candidates and --frame-seed do not apply")
+            generative_path = d / "20-generative.png"
+            stage(frame_raw, "full frame: corners from the generative variant", [base, frame_mask, generative_path],
+                  {"mode": "generative-corners", "rect": box}, a.force,
+                  lambda: generative_frame(base_img, align_to(read_image(generative_path), base_img), box, fill, a))
+        else:
+            # Candidates are the seeds from --seed on; --frame-seed picks one (generated if it is not one of them).
+            seeds = list(range(a.seed, a.seed + a.frame_candidates))
+            if a.frame_candidates == 1:
+                seeds = [frame_seed]
+            elif frame_seed not in seeds:
+                seeds.append(frame_seed)
+            candidates = []
+            for seed in seeds:
+                raw = d / f"28-full-frame-raw-s{seed}.png"
+                stage(raw, f"full frame, seed {seed} (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
+                      {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
+                       "rect": box, "quality": a.frame_quality}, a.force,
+                      lambda seed=seed: full_frame(backend, base, box, fill, a, seed))
+                candidates.append((seed, raw))
+            if len(candidates) > 1:
+                candidate_sheet([(seed, raw) for seed, raw in candidates if seed in seeds[:a.frame_candidates]],
+                                fill[box[1]:box[3], box[0]:box[2]], sheet)
+            chosen = d / f"28-full-frame-raw-s{frame_seed}.png"
+            stage(frame_raw, "full frame: chosen candidate", [chosen], {"seed": frame_seed}, a.force,
+                  lambda: chosen.read_bytes())
         frame = d / "29-full-frame.png"
         stage(frame, "full frame: upscale + CodeFormer", [frame_raw],
               {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
@@ -848,7 +901,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 def cmd_run(a) -> int:
     backend = make_backend(a.backend)
-    stages = (["conservative"] + ["generative"] * (a.generative or a.repair) + ["repair"] * (a.repair or a.full_frame)
+    stages = (["conservative"] + ["generative"] * (a.generative or a.repair or a.full_frame)
+              + ["repair"] * (a.repair or a.full_frame)
               + ["colorize"] * a.colorize)
     problems = backend.check(stages)
     if problems:
@@ -1015,7 +1069,7 @@ figure img {{ display:block; width:100%; height:auto; border-radius:4px; }}
 figcaption {{ color:var(--muted); font-size:13px; padding-top:6px; display:flex; justify-content:space-between; }}
 figcaption a {{ color:inherit; }}
 .cmp {{ position:relative; }}
-.cmp .before {{ position:absolute; inset:0; height:100%; object-fit:cover; clip-path:inset(0 calc(100% - var(--pos)) 0 0); }}
+.cmp .before {{ position:absolute; inset:0; height:100%; object-fit:fill; clip-path:inset(0 calc(100% - var(--pos)) 0 0); }}
 .cmp::after {{ content:""; position:absolute; top:0; bottom:0; left:var(--pos); width:2px; background:#fff8; pointer-events:none; }}
 .cmp input {{ position:absolute; inset:0; width:100%; height:100%; margin:0; opacity:0; cursor:ew-resize; }}
 </style></head><body>

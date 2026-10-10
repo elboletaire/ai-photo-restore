@@ -13,7 +13,7 @@ For every photo you get up to four variants, each one finished and compared with
 | **Conservative** (always) | RealESRGAN x2 + [CodeFormer](https://github.com/sczhou/CodeFormer) | Faithful: sharper faces and more resolution, nothing invented. Doesn't remove damage. |
 | **Generative** (`--generative`) | [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Damaged photos: tears, stains, scratches, missing corners. Can subtly alter faces, so always compare. |
 | **Repaired** (`--repair`, local only) | Qwen-Image-Edit-2511 on the damaged areas only, then RealESRGAN + CodeFormer | Holes, missing corners, peeled emulsion. Everything that isn't damaged, faces included, stays the original. |
-| **Full frame** (`--full-frame`, local only) | Qwen-Image-Edit-2511 on the missing parts, then RealESRGAN + CodeFormer | A rectangular picture with the mount, vignette and borders removed (the missing edges and corners are generated). Keeps the picture's own proportions. |
+| **Full frame** (`--full-frame`, local only) | Qwen-Image-Edit-2511 on the missing parts, then RealESRGAN + CodeFormer | A rectangular picture with the mount, vignette and borders removed. On a card on a scanner bed the worn rim is cropped and the corners are taken from the generative variant. Keeps the picture's own proportions. |
 | **Colorized** (`--colorize`) | [DDColor](https://github.com/piddnad/DDColor) | Natural colours, keeps the original detail (only predicts colour, never changes luminance). |
 
 Black-and-white and sepia results keep the print's own tint. AI restorers invent colour (blue eyes, pink skin) even on monochrome photos; the pipeline keeps only their luminance and rebuilds the tint from the original.

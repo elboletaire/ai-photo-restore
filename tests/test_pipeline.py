@@ -260,10 +260,10 @@ def test_print_with_a_rectangular_picture_on_an_album_page_is_cropped_to_it_with
 def test_frame_mask_is_used_inside_the_frame():
     img = cream_card()
     mask = np.zeros((600, 400), np.uint8)
-    mask[50:100, 50:100] = 255
+    mask[130:170, 130:170] = 255
     (x0, y0, x1, y1), fill = restore.picture_region(img, fill=mask)
-    assert fill[75, 75] == 255
-    assert fill.sum() == 50 * 50 * 255
+    assert fill[150, 150] == 255
+    assert fill.sum() == 40 * 40 * 255
 
 
 def test_frame_override_is_used_and_checked():
@@ -289,7 +289,7 @@ def test_full_frame_after_repair_also_gets_a_colour_version(tmp_path):
 
     b.calls.clear()
     restore.restore_one(src, tmp_path / "colour", b, args(generative=False, full_frame=True, colorize=True))
-    assert b.calls == ["conservative", "repair", "conservative", "colorize", "colorize"]
+    assert b.calls == ["conservative", "generative", "repair", "conservative", "colorize", "colorize"]
     assert bases == ["10-conservative.png", "29-full-frame.png"]  # the frame's colour version, from 29
     assert (tmp_path / "colour" / "card" / "32-full-frame-color-final.jpg").exists()
 
@@ -329,8 +329,8 @@ def test_print_in_the_scanner_corner_is_cut_from_its_bed_on_two_sides():
     img = np.full((1400, 1100, 3), 215, np.uint8)  # scanner bed, visible only on the right and bottom
     img[0:900, 0:700] = smooth_photo(900, 700)
     (x0, y0, x1, y1), fill = restore.picture_region(img)
-    assert (x1 - x0) * (y1 - y0) >= 0.9 * 900 * 700
-    assert (x0, y0) == (0, 0) or max(x0, y0) <= 12  # no inset along the sides that touch the image edge
+    assert (x1 - x0) * (y1 - y0) >= 0.85 * 900 * 700  # the worn rim on the two sides the bed touches is cropped
+    assert (x0, y0) == (0, 0)  # the sides that are the image's own edges are not cropped  # no inset along the sides that touch the image edge
     assert fill[300:600, 200:500].sum() == 0  # the picture's interior is kept; only its edge band is regenerated
 
 
@@ -338,7 +338,7 @@ def test_small_print_on_a_large_bed_is_cut_to_the_print():
     img = np.full((2000, 1500, 3), 215, np.uint8)
     img[300:1200, 300:900] = smooth_photo(900, 600)
     (x0, y0, x1, y1), fill = restore.picture_region(img)
-    assert abs(x0 - 300) <= 14 and abs(y0 - 300) <= 14 and abs(x1 - 900) <= 14 and abs(y1 - 1200) <= 14
+    assert abs(x0 - 300) <= 120 and abs(y0 - 300) <= 120 and abs(x1 - 900) <= 120 and abs(y1 - 1200) <= 120
     assert fill[600:900, 400:800].sum() == 0  # the picture's interior is kept
 
 
@@ -366,7 +366,8 @@ def test_light_chip_at_a_corner_is_filled():
     img[30:870, 30:1170] = smooth_photo(840, 1140, (120, 140, 160), seed=6)  # sepia paper, the picture to its edges
     img[30:110, 30:110] = smooth_photo(80, 80, (190, 200, 210), seed=5)  # the corner worn to bare, lighter paper
     (x0, y0, x1, y1), fill = restore.picture_region(img)
-    assert fill[70, 70] > 0  # the chip is generated
+    x0, y0 = x0 + 5, y0 + 5
+    assert fill[y0, x0] > 0  # the chip, in the corner, comes from the generative variant
     assert fill[450, 600] == 0  # the paper is kept
 
 
@@ -411,9 +412,8 @@ def test_dark_floor_strip_on_a_card_keeps_its_strip_and_regenerates_only_the_edg
     img[50:1550, 50:1050] = smooth_photo(1500, 1000, (150, 165, 180))
     img[1450:1550, 50:1050] = smooth_photo(100, 1000, (45, 60, 75), seed=3)  # the dark sepia floor, to the card's edge
     (x0, y0, x1, y1), fill = restore.picture_region(img)
-    assert y1 >= 1500  # the floor strip is not cropped away
+    assert y1 >= 1450  # the floor strip is kept, less its worn outer rim
     assert fill[1300, 500] == 0  # the picture above the strip is kept
-    assert fill[1540, 500] > 0  # the strip's outer band is regenerated
 
 
 def seeded_repair(b):
@@ -475,3 +475,63 @@ def test_full_frame_figures_compare_with_the_original_cropped_to_the_frame(tmp_p
     assert 'class="before" src="card/00-original.png"' in page  # the other variants keep the whole original
     cropped = restore.read_image(tmp_path / "out" / "card" / "28-original-frame.jpg")
     assert cropped.shape[:2] != restore.read_image(src).shape[:2]
+
+
+def bed_card():
+    """A card on a scanner bed that runs to the bed on all four sides, with a dark photo and a light corner."""
+    img = np.full((900, 1200, 3), 215, np.uint8)
+    img[30:870, 30:1170] = smooth_photo(840, 1140, (120, 140, 160), seed=6)
+    img[30:110, 30:110] = smooth_photo(80, 80, (190, 200, 210), seed=5)  # a chip of bare paper in the corner
+    return img
+
+
+def test_edge_to_edge_card_crops_the_worn_rim_and_takes_the_corners_from_the_generative(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, bed_card())
+    b = FakeBackend()
+    b.generative = lambda *a: cv2.imencode(".png", np.full((900, 1200, 3), 60, np.uint8))[1].tobytes()
+    calls_repair = []
+    b.repair = lambda *a, **k: calls_repair.append(1) or b._echo("repair", a[0])
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, generative=False))
+    assert not calls_repair  # no model call for the corners: the generative variant is their source
+    d = tmp_path / "out" / "card"
+    (x0, y0, x1, y1), fill = restore.picture_region(restore.read_image(src))
+    assert x0 >= 30 + round(0.03 * 1200) and y0 >= 30 + round(0.03 * 1200)  # the rim is cropped
+    raw = restore.read_image(d / "28-full-frame-raw.png")
+    base = restore.read_image(src)[y0:y1, x0:x1]
+    outside = fill[y0:y1, x0:x1] == 0
+    assert np.array_equal(raw[outside], base[outside])  # pixels outside the fill are the original's
+    assert raw[0, 0].mean() < base[0, 0].mean() - 40  # the corner is now the generative's (60 grey)
+    assert not (d / "28-full-frame-candidates.jpg").exists()
+
+
+def test_bare_bed_inside_a_corner_square_takes_the_generative_exactly(tmp_path):
+    img = bed_card()
+    img[30:200, 1000:1170] = 215  # the top-right corner is cut off by the bed: no paper, no photo there
+    src = tmp_path / "cut.png"
+    restore.write_image(src, img)
+    gen = np.full((900, 1200, 3), 60, np.uint8)
+    gen[:, :] = (np.arange(1200)[None, :, None] * 0.2 + np.arange(900)[:, None, None] * 0.1 + 20).astype(np.uint8)
+    box, fill, mode = restore.frame_region(img)
+    assert mode == "generative"
+    x0, y0, x1, y1 = box
+    png = restore.generative_frame(img, gen, box, fill, None)
+    out = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    bed = (restore.scanner_lid(img) > 0)[y0:y1, x0:x1]
+    expected = restore.tone_match(gen[y0:y1, x0:x1], img[y0:y1, x0:x1])
+    corner = restore.corner_squares(box, img.shape[:2], max(img.shape[:2]))[y0:y1, x0:x1] > 0
+    assert (bed & corner).sum() > 0  # the cut corner really sits inside a corner square
+    assert np.array_equal(out[bed], expected[bed])  # every bare bed pixel is the generative's, no blend
+
+
+def test_a_single_candidate_takes_the_explicit_seed_and_drops_a_stale_sheet(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    seeds = seeded_repair(b)
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, frame_candidates=3))
+    assert (tmp_path / "out" / "card" / "28-full-frame-candidates.jpg").exists()
+    seeds.clear()
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, frame_candidates=1, frame_seed=7))
+    assert seeds == [7]  # only the explicit seed is generated
+    assert not (tmp_path / "out" / "card" / "28-full-frame-candidates.jpg").exists()  # the stale sheet is gone
