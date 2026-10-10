@@ -23,7 +23,7 @@ The three photos in [examples/](examples) are real family photos from the early 
 
 **Heavy emulsion loss, worn and missing corners**
 
-| Original | Repaired | Full frame | Generative (Turbo) | Full frame, colorized |
+| Original | Repaired | Full frame | Generative (Turbo) | Colorized |
 |:---:|:---:|:---:|:---:|:---:|
 | <img src="examples/francesca-ma-osa-grau.jpg" width="170"> | <img src="examples/results/francesca-repaired.jpg" width="170"> | <img src="examples/results/francesca-full-frame.jpg" width="170"> | <img src="examples/results/francesca-turbo-generative.jpg" width="170"> | <img src="examples/results/francesca-colorized.jpg" width="170"> |
 
