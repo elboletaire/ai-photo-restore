@@ -34,7 +34,8 @@ class FakeBackend:
 
 def args(**kw):
     defaults = dict(fidelity=0.7, no_upscale=False, generative=True, prompt="p", seed=42, megapixels=1.0,
-                    repair=False, mask=None, repair_prompt="r", colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
+                    repair=False, mask=None, repair_prompt="r", full_frame=False, frame=None, frame_mask=None, frame_seed=None, frame_prompt="f",
+                    colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
     return argparse.Namespace(**{**defaults, **kw})
 
 
@@ -190,3 +191,216 @@ def test_repair_adds_a_colour_version_without_replacing_the_generative_one(photo
     b.colorize = lambda path: (bases.append(path.name), b._echo("colorize", path))[1]
     restore.restore_one(photo, tmp_path / "out", b, args(repair=True))
     assert bases == ["20-generative.png", "27-repaired.png"]
+
+
+def cream_card(h=600, w=400):
+    """A cream card with a 40 px border of the grey scanner bed around it."""
+    img = np.full((h, w, 3), 225, np.uint8)
+    img[40:h - 40, 30:w - 30] = (200, 215, 225)
+    return img
+
+
+def smooth_photo(h, w, colour=(110, 125, 140), seed=0):
+    """A photo with mild grain: no edge of it looks like worn rim."""
+    grain = np.random.default_rng(seed).normal(0, 2, (h, w, 1))
+    return np.clip(np.array(colour, float) + grain, 0, 255).astype(np.uint8)
+
+
+def vignette_card():
+    img = cream_card()
+    yy, xx = np.mgrid[0:600, 0:400]
+    img[((xx - 200) / 130.0) ** 2 + ((yy - 300) / 230.0) ** 2 <= 1] = (40, 50, 60)
+    return img
+
+
+def test_vignette_is_cut_to_the_oval_and_its_corners_are_filled():
+    img = cream_card()
+    yy, xx = np.mgrid[0:600, 0:400]
+    oval = ((xx - 200) / 130.0) ** 2 + ((yy - 300) / 230.0) ** 2 <= 1
+    img[oval] = (40, 50, 60)
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert abs(x0 - 70) <= 4 and abs(x1 - 330) <= 4 and abs(y0 - 70) <= 4 and abs(y1 - 530) <= 4
+    assert fill[y0 + 5, x0 + 5] > 0  # the rectangle's corner is outside the oval: to be generated
+    assert fill[300, 200] == 0  # the centre of the picture is kept
+
+
+def test_picture_to_the_edges_keeps_the_card_and_fills_the_missing_corner():
+    img = np.full((600, 400, 3), 225, np.uint8)  # scanner bed
+    img[20:580, 20:380] = (200, 215, 225)  # card reaching almost to the scan's edges
+    img[20:70, 330:380] = 225  # a missing corner, showing the bed
+    img[60:260, 60:340] = (120, 110, 100)  # the photo, darker than the mount
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert 20 < x0 and 20 < y0 and x1 < 380 and y1 < 580  # the worn rim is dropped
+    assert fill[y0:y1, x0:x1].any()  # the missing corner is inside the frame
+    assert fill[160, 200] == 0  # the photo is kept
+
+
+def test_already_cropped_photo_is_kept_whole():
+    img = smooth_photo(600, 400)
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert (x1 - x0) * (y1 - y0) >= 0.95 * 600 * 400
+    assert fill.sum() == 0
+
+
+def test_pale_sky_on_one_edge_is_part_of_the_picture():
+    img = smooth_photo(600, 400)
+    img[:120] = (228, 230, 232)  # neutral sky touching the top edge only
+    (x0, y0, x1, y1), _ = restore.picture_region(img)
+    assert (x1 - x0) * (y1 - y0) >= 0.9 * 600 * 400
+
+
+def test_print_with_a_rectangular_picture_on_an_album_page_is_cropped_to_it_without_fill():
+    img = np.full((600, 800, 3), (30, 40, 55), np.uint8)  # dark album page
+    img[100:500, 150:650] = smooth_photo(400, 500, (110, 125, 140), seed=1)
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert abs(x0 - 150) <= 3 and abs(x1 - 650) <= 3 and abs(y0 - 100) <= 3 and abs(y1 - 500) <= 3
+    assert (fill > 0).mean() < 0.001  # only the picture's rounded corners
+
+
+def test_frame_mask_is_used_inside_the_frame():
+    img = cream_card()
+    mask = np.zeros((600, 400), np.uint8)
+    mask[50:100, 50:100] = 255
+    (x0, y0, x1, y1), fill = restore.picture_region(img, fill=mask)
+    assert fill[75, 75] == 255
+    assert fill.sum() == 50 * 50 * 255
+
+
+def test_frame_override_is_used_and_checked():
+    img = cream_card()
+    box, _ = restore.picture_region(img, rect=(10, 10, 300, 400))
+    assert box == (10, 10, 300, 400)
+    with pytest.raises(ValueError):
+        restore.picture_region(img, rect=(0, 0, 500, 100))
+
+
+def test_full_frame_after_repair_also_gets_a_colour_version(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())  # has a mount to fill, unlike the random test photo
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    bases = []
+    b.colorize = lambda path: (bases.append(path.name), b._echo("colorize", path))[1]
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, repair=True, full_frame=True, colorize=False))
+    # the damage repair finds nothing to repair, so only the frame calls the model
+    assert b.calls == ["conservative", "generative", "conservative", "repair", "conservative"]
+    d = tmp_path / "out" / "card"
+    assert (d / "29-full-frame-final.jpg").exists() and (d / "28-frame-overlay.jpg").exists()
+
+    b.calls.clear()
+    restore.restore_one(src, tmp_path / "colour", b, args(generative=False, full_frame=True, colorize=True))
+    assert b.calls == ["conservative", "repair", "conservative", "colorize", "colorize"]
+    assert bases == ["10-conservative.png", "29-full-frame.png"]  # the frame's colour version, from 29
+    assert (tmp_path / "colour" / "card" / "32-full-frame-color-final.jpg").exists()
+
+
+def test_full_frame_rerun_with_same_settings_is_cached(photo, tmp_path):
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    b.colorize = lambda path: b._echo("colorize", path)
+    restore.restore_one(photo, tmp_path / "out", b, args(full_frame=True, colorize=True))
+    b.calls.clear()
+    restore.restore_one(photo, tmp_path / "out", b, args(full_frame=True, colorize=True))
+    assert b.calls == []
+
+
+def test_full_frame_changes_only_the_fill(tmp_path):
+    img = cream_card()
+    yy, xx = np.mgrid[0:600, 0:400]
+    img[((xx - 200) / 130.0) ** 2 + ((yy - 300) / 230.0) ** 2 <= 1] = (40, 50, 60)
+    src = tmp_path / "card.png"
+    restore.write_image(src, img)
+
+    class Garbage(FakeBackend):
+        def repair(self, path, mask, prompt, seed, megapixels):
+            out = np.random.default_rng(0).integers(0, 256, restore.read_image(path).shape, dtype=np.uint8)
+            return cv2.imencode(".png", out)[1].tobytes()
+
+    box, fill = restore.picture_region(img)
+    restore.restore_one(src, tmp_path / "out", Garbage(), args(full_frame=True, colorize=False, generative=False))
+    raw = restore.read_image(tmp_path / "out" / "card" / "28-full-frame-raw.png")
+    base = restore.read_image(src)[box[1]:box[3], box[0]:box[2]]
+    outside = fill[box[1]:box[3], box[0]:box[2]] == 0
+    assert np.array_equal(raw[outside], base[outside])
+    assert not np.array_equal(raw[~outside], base[~outside])
+
+
+def test_print_in_the_scanner_corner_is_cut_from_its_bed_on_two_sides():
+    img = np.full((1400, 1100, 3), 215, np.uint8)  # scanner bed, visible only on the right and bottom
+    img[0:900, 0:700] = smooth_photo(900, 700)
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert (x1 - x0) * (y1 - y0) >= 0.9 * 900 * 700
+    assert (x0, y0) == (0, 0) or max(x0, y0) <= 12  # no inset along the sides that touch the image edge
+    assert (fill > 0).mean() < 0.02
+
+
+def test_small_print_on_a_large_bed_is_cut_to_the_print():
+    img = np.full((2000, 1500, 3), 215, np.uint8)
+    img[300:1200, 300:900] = smooth_photo(900, 600)
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert abs(x0 - 300) <= 14 and abs(y0 - 300) <= 14 and abs(x1 - 900) <= 14 and abs(y1 - 1200) <= 14
+    assert (fill > 0).mean() < 0.02
+
+
+def test_cropped_figure_on_a_plain_backdrop_is_kept_whole():
+    img = smooth_photo(1000, 800, (120, 140, 160))
+    yy, xx = np.mgrid[0:1000, 0:800]
+    figure = ((xx - 400) / 150.0) ** 2 + ((yy - 380) / 200.0) ** 2 <= 1
+    figure |= (yy > 560) & (np.abs(xx - 400) < 300)  # shoulders and body running to the bottom edge
+    img[figure] = smooth_photo(1000, 800, (40, 50, 60), seed=2)[figure]
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert (x1 - x0) * (y1 - y0) >= 0.9 * 1000 * 800
+    assert (fill > 0).mean() < 0.01
+
+
+def test_dark_floor_strip_at_the_bottom_edge_is_kept():
+    img = smooth_photo(1500, 1000, (150, 165, 180))
+    img[1440:] = smooth_photo(60, 1000, (35, 40, 45), seed=3)  # dark floor, not worn
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert y1 >= 1490  # the strip stays
+    assert fill.sum() == 0
+
+
+def test_light_chip_at_a_corner_is_filled():
+    img = np.full((900, 1200, 3), 215, np.uint8)  # scanner bed
+    img[30:870, 30:1170] = smooth_photo(840, 1140, (120, 140, 160), seed=6)  # sepia paper, the picture to its edges
+    img[30:110, 30:110] = smooth_photo(80, 80, (190, 200, 210), seed=5)  # the corner worn to bare, lighter paper
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert fill[70, 70] > 0  # the chip is generated
+    assert fill[450, 600] == 0  # the paper is kept
+
+
+def test_scanner_bed_is_not_damage_for_a_print_in_the_corner():
+    img = np.full((1400, 1100, 3), 215, np.uint8)
+    img[0:900, 0:700] = smooth_photo(900, 700)
+    generative = img.copy()
+    generative[0:900, 0:700] = 0  # the model turned the photo black: the difference is not damage
+    bed = restore.scanner_background(img)
+    assert not restore.damage_mask(img, generative)[bed > 0].any()
+    assert restore.scanner_background(img)[1000:, 800:].all()
+
+
+def test_cropped_photo_with_no_card_outline_is_kept_whole_and_not_worn():
+    img = smooth_photo(1300, 830)
+    img[0:150, 300:500] = (235, 235, 235)  # light detail (a forehead, a bright sky) touching the top edge
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert (x0, y0, x1, y1) == (0, 0, 830, 1300)
+    assert fill.sum() == 0
+
+
+def test_changing_the_frame_seed_reruns_only_the_full_frame_stages(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    b.colorize = lambda path: b._echo("colorize", path)
+
+    def repair(path, mask, prompt, seed, megapixels):  # the output depends on the seed, as a model's does
+        b.calls.append("repair")
+        img = restore.read_image(path).astype(int) + seed % 11
+        return cv2.imencode(".png", np.clip(img, 0, 255).astype(np.uint8))[1].tobytes()
+
+    b.repair = repair
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=True))
+    b.calls.clear()
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=True, frame_seed=7))
+    assert b.calls == ["repair", "conservative", "colorize"]  # the fill, its upscale and its colour version

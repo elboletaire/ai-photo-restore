@@ -45,6 +45,10 @@ REPAIR_PROMPT = (
     "Repair the damaged areas of this old photograph: fill in the missing, torn and peeled patches so they "
     "continue the surrounding picture seamlessly. Keep it a black and white photograph."
 )
+FRAME_PROMPT = (
+    "Extend this photograph to fill the whole rectangular frame: continue the background, clothing and body "
+    "naturally into the empty areas. No oval, mount, border or vignette. Keep it a black and white photograph."
+)
 RESTORE_PROMPT = (
     "Restore this old photograph. Remove scratches, dust, stains, creases and paper damage. "
     "Recover sharp natural detail and clean tonal range. Keep the exact same people, faces, "
@@ -161,18 +165,177 @@ def align_to(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
                           borderMode=cv2.BORDER_REFLECT)
 
 
-def scanner_background(img: np.ndarray) -> np.ndarray:
+def connected_to_border(mask: np.ndarray) -> np.ndarray:
+    """The pixels of a binary mask that touch the image border through other mask pixels."""
+    _, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    return np.isin(labels, border[border > 0])
+
+
+def scanner_bed(img: np.ndarray) -> np.ndarray:
     """Mask of the grey scanner bed around the photo: neutral pixels connected to the image border.
 
     Old prints and their mounts are toned (sepia, cream), the scanner lid is not.
     """
     lab = to_lab(cv2.GaussianBlur(img, (0, 0), 2))
-    neutral = (np.hypot(lab[..., 1], lab[..., 2]) < 6).astype(np.uint8)
-    n, labels = cv2.connectedComponents(neutral)
-    border = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
-    bg = np.isin(labels, border[border > 0]).astype(np.uint8)
-    r = max(3, round(max(img.shape[:2]) / 200))  # plus the soft shadow along the card's edge
+    return connected_to_border(np.hypot(lab[..., 1], lab[..., 2]) < 6).astype(np.uint8)
+
+
+def scanner_background(img: np.ndarray) -> np.ndarray:
+    """scanner_bed plus the soft shadow along the card's edge."""
+    bg = scanner_bed(img)
+    r = max(3, round(max(img.shape[:2]) / 200))
     return cv2.dilate(bg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+
+
+def solidity(mask: np.ndarray) -> float:
+    """How much of its convex hull a shape fills: 1 for an oval or a rectangle, less for a ragged or concave one."""
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    hull = cv2.convexHull(np.vstack(contours))
+    return float(mask.sum()) / max(1.0, cv2.contourArea(hull))
+
+
+def scanner_lid(img: np.ndarray) -> np.ndarray:
+    """The scanner bed as far as a print is concerned: it runs along two or more sides of the scan, and what
+    it leaves is a solid card. A pale sky or wall along one edge of a photo is not a lid."""
+    bed = scanner_bed(img)
+    sides = [bed[0], bed[-1], bed[:, 0], bed[:, -1]]
+    if not bed.any() or sum(s.mean() >= 0.5 for s in sides) < 2 or solidity(bed == 0) < 0.9:
+        return np.zeros(img.shape[:2], np.uint8)
+    return bed
+
+
+PICTURE_DISTANCE = 12  # Lab distance from the mount colour that separates the picture from the mount
+SOLID_PICTURE = 0.95  # a picture this solid (an oval, a rectangle) is a vignette or a mount's picture
+FRAME_REACH = 0.06  # share of the long side the frame may come in from the card's edge
+WEAR_LIGHTER = 8  # Lab lightness above the card around it that makes a pixel bare paper (worn, abraded)
+MIN_PICTURE = 0.1  # the share of the card a picture in a vignette or on a mount covers, at least
+VIGNETTE_COVER = 0.8  # below this share of the card, the picture sits in a vignette or a mount
+VIGNETTE_GROW = 0.025  # share of the long side the fill grows into a curved vignette, its dark shadow ring
+FILLED_BOX = 0.97  # a picture this full of its bounding box is a rectangle: nothing to fill
+
+
+def local_card_colour(lab: np.ndarray, card: np.ndarray, sigma: float) -> np.ndarray:
+    """The card's colour around each pixel: a blur over card pixels only, so the bed does not pull it."""
+    weight = cv2.GaussianBlur(card.astype(np.float32), (0, 0), sigma) + 1e-6
+    return np.stack([cv2.GaussianBlur(lab[..., i] * card, (0, 0), sigma) / weight for i in range(3)], axis=-1)
+
+
+def reach_depth(lines: np.ndarray) -> int:
+    """How far flagged pixels reach from the edge: `lines` (one row or column per line, flags from the edge).
+
+    The median line, not the farthest: a missing or rounded corner is filled in, it does not move the whole edge.
+    """
+    if lines.size == 0:
+        return 0
+    extent = np.where(lines.any(axis=1), lines.shape[1] - np.argmax(lines[:, ::-1], axis=1), 0)
+    return int(np.percentile(extent, 50))
+
+
+def wear_mask(lab: np.ndarray, card: np.ndarray, inward: np.ndarray, reach: int) -> np.ndarray:
+    """Bare paper at the card's edge: light, abraded or chipped paper, not the dark worn rim or the picture.
+
+    Only pixels lighter than the card around them count, and only patches that touch the outline and are either
+    thin (a worn strip) or small (a chip). A light sky, wall or floor is neither.
+    """
+    long = max(card.shape)
+    deep = card & (inward > reach)  # the card past the outline: the paper the wear is lighter than
+    ref = local_card_colour(lab, deep, 0.03 * long)[..., 0]
+    lighter = card & (inward <= reach) & (lab[..., 0] - ref > WEAR_LIGHTER)
+    n, parts, stats, _ = cv2.connectedComponentsWithStats(lighter.astype(np.uint8))
+    ys, xs = np.nonzero(card)
+    cx0, cy0, cx1, cy1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+    wear = np.zeros(card.shape, bool)
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < (0.005 * long) ** 2 or not (inward[parts == i] <= 2).any():
+            continue  # specks, and patches that do not touch the outline
+        thin = area / max(w, h) <= 0.02 * long  # a worn strip; a sky, a floor or a wall is thick
+        if thin or max(w, h) <= 0.1 * long:  # or a chip: small and compact
+            wear |= parts == i
+    grow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # 2 px, the bare paper's own edge
+    return cv2.dilate(wear.astype(np.uint8), grow).astype(bool) & card
+
+
+def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = None, fill: np.ndarray | None = None):
+    """The rectangle a --full-frame photo should fill, and the pixels inside it to generate (0/255).
+
+    A picture in an oval vignette, or on a mount, keeps only its own pixels: the vignette and the mount are filled.
+    A picture running to the card's edges keeps the card minus its bare paper, and the rectangle comes in past the
+    ragged outline of the card (its rounded or missing corners). A rectangular picture on a mount is cropped.
+    `rect` and `fill` (a mask) override.
+    """
+    h, w = img.shape[:2]
+    long = max(h, w)
+    lid = scanner_lid(img)
+    card = lid == 0
+    outlined = lid.any()  # a card on a scanner bed has a worn outline; a cropped photo has none
+    if not card.any():
+        card[:] = True
+    ys, xs = np.nonzero(card)
+    cx0, cy0, cx1, cy1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+    lab = to_lab(cv2.GaussianBlur(img, (0, 0), 2))
+
+    # The mount colour: the median of a band just inside the card.
+    band = max(3, round(0.03 * long))
+    edge = np.zeros((h, w), bool)
+    edge[cy0:cy1, cx0:cx1] = True
+    edge[cy0 + band:cy1 - band, cx0 + band:cx1 - band] = False
+    d = np.linalg.norm(lab - np.median(lab[edge & card], axis=0), axis=2)
+    mounted = (d[edge & card] <= PICTURE_DISTANCE).mean() >= 0.9  # a uniform band: a mount, not the picture
+    pic = ((d > PICTURE_DISTANCE) & card).astype(np.uint8)
+    pic = cv2.morphologyEx(pic, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(pic)
+    pic = labels == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]) if n > 1 else card.copy()
+    pic = pic | ~connected_to_border(~pic)  # holes: a face, a light patch of the picture
+
+    picture_share = pic.sum() / card.sum()  # a blemish or a chip is not a picture on a mount
+    vignette = mounted and MIN_PICTURE <= picture_share < VIGNETTE_COVER and solidity(pic) >= SOLID_PICTURE
+    if vignette:
+        keep = pic
+        ys, xs = np.nonzero(pic)
+        box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+        curved = pic.sum() < FILLED_BOX * (box[2] - box[0]) * (box[3] - box[1])
+    else:
+        # The outline: where the bed bites into the card's bounding box, the rectangle comes in past it.
+        reach = max(3, round(FRAME_REACH * long))
+        margin = round(0.005 * long) if outlined else 0
+        bed = ~card
+        depth = [
+            reach_depth(bed[cy0:cy1, cx0:cx0 + reach]),
+            reach_depth(bed[cy0:cy1, cx1 - reach:cx1][:, ::-1]),
+            reach_depth(bed[cy0:cy0 + reach, cx0:cx1].T),
+            reach_depth(bed[cy1 - reach:cy1, cx0:cx1][::-1].T),
+        ]
+        il, ir, it, ib = (min(reach, v + margin) for v in depth)
+        inward = cv2.distanceTransform(np.pad(card, 1).astype(np.uint8), cv2.DIST_L2, 3)[1:-1, 1:-1]
+        keep = card & ~wear_mask(lab, card, inward, reach) if outlined else card
+        box = (cx0 + il, cy0 + it, cx1 - ir, cy1 - ib)
+        curved = False
+        if box[2] <= box[0] or box[3] <= box[1]:
+            box = (cx0, cy0, cx1, cy1)
+    if rect is not None:  # --frame
+        x0, y0, x1, y1 = rect
+        if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+            raise ValueError(f"--frame {x0},{y0},{x1},{y1} is outside the {w}x{h} photo")
+        box = rect
+    x0, y0, x1, y1 = (int(v) for v in box)
+    inside = np.zeros((h, w), np.uint8)
+    inside[y0:y1, x0:x1] = 1
+    if fill is not None:  # --frame-mask: the user's own mask
+        return (x0, y0, x1, y1), ((fill > 0).astype(np.uint8) * inside) * 255
+    if vignette and curved:  # the vignette's soft edge, its dark shadow ring included, is grown into
+        grow = round(long * VIGNETTE_GROW)
+    elif vignette:
+        grow = 0
+    else:
+        grow = 2  # the antialiased edge of the card
+    outside = (~keep).astype(np.uint8)
+    if grow:
+        outside = cv2.dilate(outside, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    return (x0, y0, x1, y1), (outside & inside) * 255
 
 
 def damage_mask(original: np.ndarray, generative: np.ndarray, threshold: float = 15) -> np.ndarray:
@@ -213,11 +376,16 @@ def mask_box(mask: np.ndarray, pad: float = 0.1) -> tuple[int, int, int, int]:
     return max(0, xs.min() - p), max(0, ys.min() - p), min(w, xs.max() + 1 + p), min(h, ys.max() + 1 + p)
 
 
-def paste(original: np.ndarray, patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Original everywhere except under `mask`, where `patch` (same size) goes, with feathered edges."""
+def paste(original: np.ndarray, patch: np.ndarray, mask: np.ndarray, outward: bool = True) -> np.ndarray:
+    """Original everywhere except under `mask`, where `patch` (same size) goes, with feathered edges.
+
+    Damage is repaired outwards: the feather reaches past the mask so no damage shows. A fill is feathered
+    inwards instead, so everything outside the mask stays bit-identical to the original.
+    """
     r = max(1.0, max(mask.shape) / 600)
-    alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), r)[..., None]
-    alpha = np.maximum(alpha, (mask > 0)[..., None])  # feather outwards only: the damage itself must go
+    alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), r)
+    alpha = np.maximum(alpha, mask > 0) if outward else np.minimum(alpha, mask > 0)
+    alpha = alpha[..., None]
     return (original * (1 - alpha) + patch * alpha + 0.5).astype(np.uint8)
 
 
@@ -325,7 +493,7 @@ class FalBackend:
     def check(self, stages: list[str]) -> list[str]:
         problems = [] if self.key else ["FAL_KEY is not set (create one at https://fal.ai/dashboard/keys)"]
         if "repair" in stages:
-            problems.append("--repair only works with the local backend for now")
+            problems.append("--repair and --full-frame only work with the local backend for now")
         return problems
 
     def _call(self, endpoint: str, payload: dict) -> bytes:
@@ -356,7 +524,7 @@ class FalBackend:
                                                           "seed": seed, "output_format": "png"})
 
     def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float) -> bytes:
-        raise RuntimeError("--repair only works with the local backend for now")
+        raise RuntimeError("--repair and --full-frame only work with the local backend for now")
 
     def colorize(self, path: Path) -> bytes:
         return self._call("fal-ai/ddcolor", {"image_url": self._data_uri(path)})
@@ -431,7 +599,7 @@ def stage(target: Path, label: str, inputs: list[Path], settings: dict, force: b
     """
     record = target.parent / "stages.json"
     done = json.loads(record.read_text(encoding="utf-8")) if record.exists() else {}
-    key = {**settings, "inputs": [digest(p) for p in inputs]}
+    key = json.loads(json.dumps({**settings, "inputs": [digest(p) for p in inputs]}))  # as stages.json stores it
     if target.exists() and not force and done.get(target.name) == key:
         print(f"  = {label} (cached)")
         return
@@ -442,24 +610,92 @@ def stage(target: Path, label: str, inputs: list[Path], settings: dict, force: b
     print(f"  ✓ {label} ({time.time() - t0:.1f}s)", flush=True)
 
 
-def repair_damage(backend, original: Path, mask: Path, a) -> bytes:
-    """Regenerate only the masked areas: send the damaged region (with some context) to the model,
-    then paste its result back under the mask. Everything outside the mask stays the original."""
-    img = read_image(original)
-    m = read_mask(mask, img.shape[:2])
-    if not m.any():
-        return cv2.imencode(".png", img)[1].tobytes()
-    x0, y0, x1, y1 = mask_box(m)
-    crop, mcrop = img[y0:y1, x0:x1], m[y0:y1, x0:x1]
+def inpaint(backend, img: np.ndarray, mask: np.ndarray, prompt: str, a, box=None, outward: bool = True,
+            seed: int | None = None) -> np.ndarray:
+    """Regenerate the masked pixels of `img`: send a region around them (or `box`) to the model, then paste
+    its result back under the mask. Everything outside the mask stays the same."""
+    if not mask.any():
+        return img.copy()
+    x0, y0, x1, y1 = box or mask_box(mask)
+    crop, mcrop = img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
     with tempfile.TemporaryDirectory() as tmp:
         crop_path, mask_path = Path(tmp) / "crop.png", Path(tmp) / "mask.png"
         write_image(crop_path, crop)
         write_image(mask_path, mcrop)
-        out = cv2.imdecode(np.frombuffer(backend.repair(crop_path, mask_path, a.repair_prompt, a.seed, a.megapixels),
+        out = cv2.imdecode(np.frombuffer(backend.repair(crop_path, mask_path, prompt, a.seed if seed is None else seed,
+                                                        a.megapixels),
                                          np.uint8), cv2.IMREAD_COLOR)
     patch = tone_match(cv2.resize(out, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LANCZOS4), crop)
-    img[y0:y1, x0:x1] = paste(crop, patch, mcrop)
+    result = img.copy()
+    result[y0:y1, x0:x1] = paste(crop, patch, mcrop, outward)
+    return result
+
+
+def repair_damage(backend, original: Path, mask: Path, a) -> bytes:
+    """Regenerate only the damaged areas, see inpaint."""
+    img = read_image(original)
+    return cv2.imencode(".png", inpaint(backend, img, read_mask(mask, img.shape[:2]), a.repair_prompt, a))[1].tobytes()
+
+
+def merge_boxes(boxes: list[tuple]) -> list[tuple]:
+    """Join the boxes that overlap, so two crops never meet along a seam."""
+    boxes = list(boxes)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                (ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1) = boxes[i], boxes[j]
+                if ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1:
+                    boxes[i] = (min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1))
+                    del boxes[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return boxes
+
+
+def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a) -> bytes:
+    """Fill the picture's missing edges, corners and mount, inside the whole rectangle `box`.
+
+    Each separate hole is generated from a padded crop around it, so the model works near native resolution.
+    Crops that overlap are generated together.
+    """
+    x0, y0, x1, y1 = box
+    img = read_image(base)[y0:y1, x0:x1]
+    m = fill[y0:y1, x0:x1]
+    todo = m > 0
+    h, w = img.shape[:2]
+    n, parts = cv2.connectedComponents(todo.astype(np.uint8))
+    crops = []
+    for i in range(1, n):
+        ys, xs = np.nonzero(parts == i)
+        size = max(ys.max() - ys.min(), xs.max() - xs.min()) + 1
+        pad = max(16, round(0.5 * size), round(0.1 * max(h, w)))  # the floor and backdrop around it, not just the hole
+        crops.append((max(0, xs.min() - pad), max(0, ys.min() - pad),
+                      min(w, xs.max() + 1 + pad), min(h, ys.max() + 1 + pad)))
+    for bx in merge_boxes(crops):
+        if not todo[bx[1]:bx[3], bx[0]:bx[2]].any():  # already generated with a neighbouring crop
+            continue
+        mask = np.zeros((h, w), np.uint8)
+        mask[bx[1]:bx[3], bx[0]:bx[2]] = todo[bx[1]:bx[3], bx[0]:bx[2]] * 255
+        img = inpaint(backend, img, mask, a.frame_prompt, a, box=bx, outward=False,
+                      seed=a.seed if a.frame_seed is None else a.frame_seed)
+        todo[bx[1]:bx[3], bx[0]:bx[2]] = False
+    # The model sprinkles bright specks over the smooth dark areas it generates: median them out (fill only).
+    med = cv2.medianBlur(img, 5)
+    speck = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & (m > 0)
+    img[speck] = med[speck]
     return cv2.imencode(".png", img)[1].tobytes()
+
+
+def frame_overlay(img: np.ndarray, box: tuple, fill: np.ndarray) -> np.ndarray:
+    """The frame rectangle in green, the area the model will fill in red."""
+    out = damage_overlay(img, fill)
+    x0, y0, x1, y1 = box
+    cv2.rectangle(out, (x0, y0), (x1 - 1, y1 - 1), (0, 255, 0), max(2, max(img.shape[:2]) // 300))
+    return out
 
 
 def output_names(files: list[Path]) -> list[str]:
@@ -519,12 +755,41 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
               lambda: backend.conservative(repaired_raw, a.fidelity, not a.no_upscale))
         variants.append((repaired, a.tone))
 
+    frame = None
+    frame_seed = a.frame_seed if a.frame_seed is not None else a.seed
+    if a.full_frame:
+        base = d / "26-repaired-raw.png" if a.repair else original
+        base_img = read_image(base)
+        user_fill = read_mask(Path(a.frame_mask).expanduser(), base_img.shape[:2]) if a.frame_mask else None
+        box, fill = picture_region(base_img, a.frame, user_fill)
+        write_image(d / "28-frame-overlay.jpg", frame_overlay(base_img, box, fill))
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        kept = bw * bh / (base_img.shape[0] * base_img.shape[1])
+        source = "from --frame" if a.frame else "from --frame-mask" if a.frame_mask else "detected"
+        print(f"  ✓ frame {bw}x{bh} at {','.join(map(str, box))} ({source}; "
+              f"{100 * (fill > 0).sum() / (bw * bh):.1f}% to fill)")
+        if kept < 0.9:
+            print(f"  ! the frame keeps only {kept:.0%} of the photo: check 28-frame-overlay.jpg")
+        frame_mask = d / "28-frame-mask.png"  # an input of the stage, so a change of detection reruns it
+        write_image(frame_mask, fill)
+        frame_raw = d / "28-full-frame-raw.png"
+        stage(frame_raw, "full frame (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
+              {"backend": backend.name, "prompt": a.frame_prompt, "seed": frame_seed, "megapixels": a.megapixels,
+               "rect": box}, a.force, lambda: full_frame(backend, base, box, fill, a))
+        frame = d / "29-full-frame.png"
+        stage(frame, "full frame: upscale + CodeFormer", [frame_raw],
+              {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
+              lambda: backend.conservative(frame_raw, a.fidelity, not a.no_upscale))
+        variants.append((frame, a.tone))
+
     if a.colorize:
         # The generative (or conservative) colour version, plus one of the repaired image: it keeps the
         # original faces, but the generative one usually looks cleaner, so it doesn't replace it.
         bases = [(color_base, d / "30-color.png")]
         if a.repair:
             bases.append((repaired, d / "31-repaired-color.png"))
+        if frame:
+            bases.append((frame, d / "32-full-frame-color.png"))
         for base, color in bases:
             stage(color, f"colorize {base.stem} (DDColor)", [base], {"backend": backend.name}, a.force,
                   lambda base=base: backend.colorize(base))
@@ -546,7 +811,7 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 def cmd_run(a) -> int:
     backend = make_backend(a.backend)
-    stages = (["conservative"] + ["generative"] * (a.generative or a.repair) + ["repair"] * a.repair
+    stages = (["conservative"] + ["generative"] * (a.generative or a.repair) + ["repair"] * (a.repair or a.full_frame)
               + ["colorize"] * a.colorize)
     problems = backend.check(stages)
     if problems:
@@ -558,6 +823,15 @@ def cmd_run(a) -> int:
     if a.mask and (len(files) != 1 or not a.repair):
         print("--mask needs --repair and a single photo", file=sys.stderr)
         return 2
+    if (a.frame or a.frame_mask) and (len(files) != 1 or not a.full_frame):
+        print("--frame and --frame-mask need --full-frame and a single photo", file=sys.stderr)
+        return 2
+    if a.frame:
+        h, w = read_image(files[0]).shape[:2]
+        x0, y0, x1, y1 = a.frame
+        if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+            print(f"--frame {x0},{y0},{x1},{y1} is outside the {w}x{h} photo", file=sys.stderr)
+            return 2
     for src, name in zip(files, output_names(files)):
         try:
             restore_one(src, out_root, backend, a, name)
@@ -571,7 +845,7 @@ def cmd_run(a) -> int:
 def cmd_doctor(a) -> int:
     backend = make_backend(a.backend)
     failed = []
-    for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("repair", " (--repair)"),
+    for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("repair", " (--repair, --full-frame)"),
                        ("colorize", " (--colorize)")):
         problems = backend.check([name])
         print(f"{'✗' if problems else '✓'} {name}{flag}")
@@ -661,8 +935,9 @@ def cmd_setup_local(a) -> int:
 # ---------------------------------------------------------------- comparison page
 
 LABELS = {"10-conservative-final.jpg": "Conservative", "20-generative-final.jpg": "Generative",
-          "27-repaired-final.jpg": "Repaired", "30-color-final.jpg": "Colorized",
-          "31-repaired-color-final.jpg": "Repaired, colorized"}
+          "27-repaired-final.jpg": "Repaired", "29-full-frame-final.jpg": "Full frame",
+          "30-color-final.jpg": "Colorized", "31-repaired-color-final.jpg": "Repaired, colorized",
+          "32-full-frame-color-final.jpg": "Full frame, colorized"}
 
 
 def write_sheet(out_root: Path) -> Path:
@@ -709,6 +984,14 @@ figcaption a {{ color:inherit; }}
 
 # ---------------------------------------------------------------- cli
 
+def parse_frame(text: str) -> tuple[int, int, int, int]:
+    try:
+        x0, y0, x1, y1 = (int(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected X0,Y0,X1,Y1 in pixels") from None
+    return x0, y0, x1, y1
+
+
 def main() -> int:
     # Windows consoles/pipes default to a legacy code page that can't print ✓/✗/▶.
     for stream in (sys.stdout, sys.stderr):
@@ -725,6 +1008,8 @@ def main() -> int:
     r.add_argument("--generative", action="store_true", help="add a Qwen-Image-Edit restoration variant")
     r.add_argument("--prompt", default=RESTORE_PROMPT, help="generative restoration prompt")
     r.add_argument("--seed", type=int, default=42)
+    r.add_argument("--frame-seed", type=int, help="seed of the full-frame fill only (default: --seed); "
+                                                  "rerolls a bad fill without rerunning the other AI stages")
     r.add_argument("--megapixels", type=float, default=1.0, help="generative working size (local backend)")
     r.add_argument("--repair", action="store_true",
                    help="add a variant that regenerates only the damaged areas (holes, peeled emulsion, stains); "
@@ -732,6 +1017,14 @@ def main() -> int:
     r.add_argument("--mask", help="with --repair and a single photo: use this damage mask (white = damaged) "
                                   "instead of the detected one")
     r.add_argument("--repair-prompt", default=REPAIR_PROMPT, help="instruction for --repair")
+    r.add_argument("--full-frame", action="store_true",
+                   help="add a variant with the mount, vignette and borders removed: a rectangular picture, "
+                        "with the missing edges and corners generated (local only). Check 28-frame-overlay.jpg")
+    r.add_argument("--frame", type=parse_frame, help="with --full-frame and a single photo: use this rectangle "
+                                                     "X0,Y0,X1,Y1 (pixels) instead of the detected one")
+    r.add_argument("--frame-mask", help="with --full-frame and a single photo: fill this mask (white = to generate) "
+                                        "instead of the detected one; the frame stays the detected one or --frame")
+    r.add_argument("--frame-prompt", default=FRAME_PROMPT, help="instruction for --full-frame")
     r.add_argument("--colorize", action="store_true", help="add a DDColor colorized variant")
     r.add_argument("--saturation", type=float, default=0.85,
                    help="colorized variant: colour strength (1 = as DDColor makes it, 0 = grey)")

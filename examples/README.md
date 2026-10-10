@@ -11,5 +11,5 @@ Real family photos (public domain) used to test the pipeline. Each one covers a 
 Run them all with:
 
 ```bash
-uv run skills/restore-photos/scripts/restore.py run examples --repair --colorize --out restored
+uv run skills/restore-photos/scripts/restore.py run examples --repair --full-frame --colorize --out restored
 ```
