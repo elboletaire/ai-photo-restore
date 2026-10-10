@@ -331,7 +331,7 @@ def test_print_in_the_scanner_corner_is_cut_from_its_bed_on_two_sides():
     (x0, y0, x1, y1), fill = restore.picture_region(img)
     assert (x1 - x0) * (y1 - y0) >= 0.9 * 900 * 700
     assert (x0, y0) == (0, 0) or max(x0, y0) <= 12  # no inset along the sides that touch the image edge
-    assert (fill > 0).mean() < 0.02
+    assert fill[300:600, 200:500].sum() == 0  # the picture's interior is kept; only its edge band is regenerated
 
 
 def test_small_print_on_a_large_bed_is_cut_to_the_print():
@@ -339,7 +339,7 @@ def test_small_print_on_a_large_bed_is_cut_to_the_print():
     img[300:1200, 300:900] = smooth_photo(900, 600)
     (x0, y0, x1, y1), fill = restore.picture_region(img)
     assert abs(x0 - 300) <= 14 and abs(y0 - 300) <= 14 and abs(x1 - 900) <= 14 and abs(y1 - 1200) <= 14
-    assert (fill > 0).mean() < 0.02
+    assert fill[600:900, 400:800].sum() == 0  # the picture's interior is kept
 
 
 def test_cropped_figure_on_a_plain_backdrop_is_kept_whole():
@@ -404,3 +404,13 @@ def test_changing_the_frame_seed_reruns_only_the_full_frame_stages(tmp_path):
     b.calls.clear()
     restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=True, frame_seed=7))
     assert b.calls == ["repair", "conservative", "colorize"]  # the fill, its upscale and its colour version
+
+
+def test_dark_floor_strip_on_a_card_keeps_its_strip_and_regenerates_only_the_edge_band():
+    img = np.full((1600, 1100, 3), 215, np.uint8)  # scanner bed
+    img[50:1550, 50:1050] = smooth_photo(1500, 1000, (150, 165, 180))
+    img[1450:1550, 50:1050] = smooth_photo(100, 1000, (45, 60, 75), seed=3)  # the dark sepia floor, to the card's edge
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    assert y1 >= 1500  # the floor strip is not cropped away
+    assert fill[1300, 500] == 0  # the picture above the strip is kept
+    assert fill[1540, 500] > 0  # the strip's outer band is regenerated

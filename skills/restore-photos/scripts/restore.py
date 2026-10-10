@@ -210,17 +210,12 @@ def scanner_lid(img: np.ndarray) -> np.ndarray:
 PICTURE_DISTANCE = 12  # Lab distance from the mount colour that separates the picture from the mount
 SOLID_PICTURE = 0.95  # a picture this solid (an oval, a rectangle) is a vignette or a mount's picture
 FRAME_REACH = 0.06  # share of the long side the frame may come in from the card's edge
-WEAR_LIGHTER = 8  # Lab lightness above the card around it that makes a pixel bare paper (worn, abraded)
+EDGE_BAND = 0.03  # share of the long side, along each edge of a card on a scanner bed, that is regenerated
+CORNER_SQUARE = 0.08  # share of the long side, the square in each corner that is regenerated (rounded, chipped)
 MIN_PICTURE = 0.1  # the share of the card a picture in a vignette or on a mount covers, at least
 VIGNETTE_COVER = 0.8  # below this share of the card, the picture sits in a vignette or a mount
 VIGNETTE_GROW = 0.025  # share of the long side the fill grows into a curved vignette, its dark shadow ring
 FILLED_BOX = 0.97  # a picture this full of its bounding box is a rectangle: nothing to fill
-
-
-def local_card_colour(lab: np.ndarray, card: np.ndarray, sigma: float) -> np.ndarray:
-    """The card's colour around each pixel: a blur over card pixels only, so the bed does not pull it."""
-    weight = cv2.GaussianBlur(card.astype(np.float32), (0, 0), sigma) + 1e-6
-    return np.stack([cv2.GaussianBlur(lab[..., i] * card, (0, 0), sigma) / weight for i in range(3)], axis=-1)
 
 
 def reach_depth(lines: np.ndarray) -> int:
@@ -234,29 +229,21 @@ def reach_depth(lines: np.ndarray) -> int:
     return int(np.percentile(extent, 50))
 
 
-def wear_mask(lab: np.ndarray, card: np.ndarray, inward: np.ndarray, reach: int) -> np.ndarray:
-    """Bare paper at the card's edge: light, abraded or chipped paper, not the dark worn rim or the picture.
+def edge_band(box: tuple, shape: tuple[int, int], long: int) -> np.ndarray:
+    """A fixed band along the four edges of the rectangle `box`, plus a square in each corner (0/1).
 
-    Only pixels lighter than the card around them count, and only patches that touch the outline and are either
-    thin (a worn strip) or small (a chip). A light sky, wall or floor is neither.
+    The worn edge of a card and its rounded or chipped corners lie within these, whatever their colour.
     """
-    long = max(card.shape)
-    deep = card & (inward > reach)  # the card past the outline: the paper the wear is lighter than
-    ref = local_card_colour(lab, deep, 0.03 * long)[..., 0]
-    lighter = card & (inward <= reach) & (lab[..., 0] - ref > WEAR_LIGHTER)
-    n, parts, stats, _ = cv2.connectedComponentsWithStats(lighter.astype(np.uint8))
-    ys, xs = np.nonzero(card)
-    cx0, cy0, cx1, cy1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-    wear = np.zeros(card.shape, bool)
-    for i in range(1, n):
-        x, y, w, h, area = stats[i]
-        if area < (0.005 * long) ** 2 or not (inward[parts == i] <= 2).any():
-            continue  # specks, and patches that do not touch the outline
-        thin = area / max(w, h) <= 0.02 * long  # a worn strip; a sky, a floor or a wall is thick
-        if thin or max(w, h) <= 0.1 * long:  # or a chip: small and compact
-            wear |= parts == i
-    grow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # 2 px, the bare paper's own edge
-    return cv2.dilate(wear.astype(np.uint8), grow).astype(bool) & card
+    x0, y0, x1, y1 = box
+    band, corner = round(EDGE_BAND * long), round(CORNER_SQUARE * long)
+    rect = np.zeros(shape, np.uint8)
+    rect[y0:y1, x0:x1] = 1
+    inner = np.zeros(shape, np.uint8)
+    inner[y0 + band:max(y0 + band, y1 - band), x0 + band:max(x0 + band, x1 - band)] = 1
+    squares = np.zeros(shape, np.uint8)
+    for cx, cy in [(x0, y0), (x1 - corner, y0), (x0, y1 - corner), (x1 - corner, y1 - corner)]:
+        squares[max(0, cy):cy + corner, max(0, cx):cx + corner] = 1
+    return (((rect & (1 - inner)) | squares) & rect).astype(np.uint8)
 
 
 def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = None, fill: np.ndarray | None = None):
@@ -310,8 +297,7 @@ def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = Non
             reach_depth(bed[cy1 - reach:cy1, cx0:cx1][::-1].T),
         ]
         il, ir, it, ib = (min(reach, v + margin) for v in depth)
-        inward = cv2.distanceTransform(np.pad(card, 1).astype(np.uint8), cv2.DIST_L2, 3)[1:-1, 1:-1]
-        keep = card & ~wear_mask(lab, card, inward, reach) if outlined else card
+        keep = card
         box = (cx0 + il, cy0 + it, cx1 - ir, cy1 - ib)
         curved = False
         if box[2] <= box[0] or box[3] <= box[1]:
@@ -335,6 +321,8 @@ def picture_region(img: np.ndarray, rect: tuple[int, int, int, int] | None = Non
     outside = (~keep).astype(np.uint8)
     if grow:
         outside = cv2.dilate(outside, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    if outlined and not vignette:  # a card on a scanner bed: its worn edge and corners are regenerated too
+        outside = np.maximum(outside, edge_band((x0, y0, x1, y1), (h, w), long))
     return (x0, y0, x1, y1), (outside & inside) * 255
 
 
