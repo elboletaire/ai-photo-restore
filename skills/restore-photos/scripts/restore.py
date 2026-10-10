@@ -696,6 +696,40 @@ def candidate_sheet(candidates: list[tuple[int, Path]], fill: np.ndarray, out: P
     write_image(out, np.hstack(tiles[:-1]))
 
 
+def frame_rect(frame_shape: tuple, box: tuple) -> tuple[int, int, int, int]:
+    """Where the frame (upscaled from the rectangle `box`) sits in the upscaled picture: x, y, w, h."""
+    x0, y0, x1, y1 = box
+    fh, fw = frame_shape[:2]
+    return round(x0 * fw / (x1 - x0)), round(y0 * fh / (y1 - y0)), fw, fh
+
+
+def colour_context(canvas: np.ndarray, frame: np.ndarray, base_shape: tuple, box: tuple) -> np.ndarray:
+    """The full frame placed back into its uncropped surroundings, at the frame's own scale.
+
+    `canvas` is the upscaled picture (uncropped), `base_shape` the size of the picture it was made from, `box` the
+    rectangle in that picture. The canvas is scaled to the frame's scale and the frame is pasted at its rectangle.
+    """
+    fh, fw = frame.shape[:2]
+    out = cv2.resize(canvas, (round(base_shape[1] * fw / (box[2] - box[0])),
+                              round(base_shape[0] * fh / (box[3] - box[1]))), interpolation=cv2.INTER_CUBIC)
+    x, y, w, h = frame_rect(frame.shape, box)
+    if x + w > out.shape[1] or y + h > out.shape[0]:
+        raise ValueError("the frame does not fit in the upscaled picture")
+    out[y:y + h, x:x + w] = frame
+    return out
+
+
+def crop_back(img: np.ndarray, rect: tuple) -> np.ndarray:
+    x, y, w, h = rect
+    return img[y:y + h, x:x + w]
+
+
+def colour_frame_bytes(backend, canvas: Path, frame_shape: tuple, box: tuple) -> bytes:
+    """DDColor on the canvas (one call), cropped back to the frame's rectangle: the frame's exact size."""
+    out = cv2.imdecode(np.frombuffer(backend.colorize(canvas), np.uint8), cv2.IMREAD_COLOR)
+    return cv2.imencode(".png", crop_back(out, frame_rect(frame_shape, box)))[1].tobytes()
+
+
 def generative_frame(base_img: np.ndarray, gen_img: np.ndarray, box: tuple, fill: np.ndarray, a) -> bytes:
     """The rectangle `box` with its corners and missing paper taken from the aligned generative variant."""
     x0, y0, x1, y1 = box
@@ -878,11 +912,26 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         bases = [(color_base, d / "30-color.png")]
         if a.repair:
             bases.append((repaired, d / "31-repaired-color.png"))
-        if frame:
-            bases.append((frame, d / "32-full-frame-color.png"))
         for base, color in bases:
             stage(color, f"colorize {base.stem} (DDColor)", [base], {"backend": backend.name}, a.force,
                   lambda base=base: backend.colorize(base))
+            variants.append((color, "color"))
+        if frame:
+            # The frame alone looks green to DDColor (no surroundings to tell the skin and paper apart), so it is
+            # coloured inside its uncropped picture and cropped back: one colorize call, the frame's exact size.
+            canvas_src = repaired if a.repair else conservative
+            canvas = d / "32-full-frame-canvas.png"
+
+            def compose():
+                out = colour_context(read_image(canvas_src), read_image(frame), base_img.shape[:2], box)
+                return cv2.imencode(".png", out)[1].tobytes()
+
+            stage(canvas, "full frame: placed in its surroundings", [canvas_src, frame, base],
+                  {"rect": box}, a.force, compose)
+            color = d / "32-full-frame-color.png"
+            stage(color, "colorize the full frame in its surroundings (DDColor)", [canvas],
+                  {"backend": backend.name, "rect": box}, a.force,
+                  lambda: colour_frame_bytes(backend, canvas, read_image(frame).shape, box))
             variants.append((color, "color"))
 
     orig_img = read_image(original)

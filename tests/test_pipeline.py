@@ -290,8 +290,46 @@ def test_full_frame_after_repair_also_gets_a_colour_version(tmp_path):
     b.calls.clear()
     restore.restore_one(src, tmp_path / "colour", b, args(generative=False, full_frame=True, colorize=True))
     assert b.calls == ["conservative", "generative", "repair", "conservative", "colorize", "colorize"]
-    assert bases == ["10-conservative.png", "29-full-frame.png"]  # the frame's colour version, from 29
+    assert bases == ["10-conservative.png", "32-full-frame-canvas.png"]  # the frame is coloured in its surroundings
     assert (tmp_path / "colour" / "card" / "32-full-frame-color-final.jpg").exists()
+
+
+def test_the_frame_is_coloured_inside_its_surroundings_and_cropped_back(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+
+    def tint(img):  # the colour depends on the whole picture, so the frame alone gets a different one
+        k = int(round(img.mean() - 128))
+        return np.clip(img.astype(int) + np.array([0, 0, k]), 0, 255).astype(np.uint8)
+
+    b.colorize = lambda path: cv2.imencode(".png", tint(restore.read_image(path)))[1].tobytes()
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, full_frame=True, colorize=True))
+    d = tmp_path / "out" / "card"
+    frame = restore.read_image(d / "29-full-frame.png")
+    color = restore.read_image(d / "32-full-frame-color.png")
+    canvas = restore.read_image(d / "32-full-frame-canvas.png")
+    box, _ = restore.picture_region(restore.read_image(src))
+    rect = restore.frame_rect(frame.shape, box)
+    assert color.shape == frame.shape  # 32 has 29's size
+    assert np.array_equal(restore.crop_back(canvas, rect), frame)  # the frame sits unchanged in its surroundings
+    assert np.array_equal(color, restore.crop_back(tint(canvas), rect))  # one call on the canvas, cropped back
+    assert not np.array_equal(color, tint(frame))  # and not the frame coloured alone
+
+
+def test_the_canvas_is_the_repaired_picture_when_repairing(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, repair=True, full_frame=True, colorize=True))
+    d = tmp_path / "out" / "card"
+    frame = restore.read_image(d / "29-full-frame.png")
+    canvas = restore.read_image(d / "32-full-frame-canvas.png")
+    box, _ = restore.picture_region(restore.read_image(d / "26-repaired-raw.png"))
+    assert np.array_equal(restore.crop_back(canvas, restore.frame_rect(frame.shape, box)), frame)
+    assert canvas.shape[:2] == restore.read_image(d / "27-repaired.png").shape[:2]
 
 
 def test_full_frame_rerun_with_same_settings_is_cached(photo, tmp_path):
