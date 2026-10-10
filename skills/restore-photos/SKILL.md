@@ -49,8 +49,8 @@ Read the images and decide per photo:
 - **Mount, oval vignette or borders** (a card with a picture inside an oval, or worn edges and rounded or missing corners) → add `--full-frame`. It makes a clean rectangular picture: the mount and the borders are removed and the missing parts are generated, so the variant keeps the picture's own proportions. Use it when the user wants the photo without its frame; it is an extra variant, the others are kept. Always review `28-frame-overlay.jpg` (green = the rectangle, red = what gets generated). To fix it, for a single photo: `--frame X0,Y0,X1,Y1` (pixels) moves the rectangle, keeping the detected fill; `--frame-mask <file>` (white = generate) replaces the fill, e.g. to paint over a mount the detection missed; both can be combined. A print that keeps less than 90% of the scan gets a warning. A reroll of a bad fill: `--frame-seed N` (default: `--seed`) reruns only the full-frame stages.
 
 Limitations of `--full-frame`:
-- Wear detection can catch light picture detail at a card's edge (a bright sky, a forehead), so check that no face or important detail is red. If it is, fix the fill with `--frame-mask`.
-- Generated corners can invent content (a dark wedge where a floor or backdrop should be). Compare with the original, then reroll with `--frame-seed`.
+- On a card that runs to the scan's edges, the fill is a fixed band along the four edges (3% of the long side) plus a square in each corner (8%). A face is never that close to the edge, but check that no important detail is red. If it is, fix the fill with `--frame-mask`.
+- Generated corners and hands can invent content (a dark wedge where a floor should be, a claw-like hand). Compare with the original and retry (section 5).
 - Vignette mode also regenerates a thin band just inside the oval's shadow ring.
 - Vignette fills are generated at about 1 MP.
 - **Colorize** only if asked. `--saturation` (default 0.85) sets the colour strength; lower it if colours look painted-on, raise it towards 1 for DDColor's full colour.
@@ -78,6 +78,17 @@ Read each `*-final.jpg` next to `00-original.*` and check:
 - **Colour** — DDColor sometimes over-saturates small items (pocket squares, flowers). If the whole photo looks too colourful, rerun with a lower `--saturation` (instant, nothing is recomputed).
 
 Then point the user to `<out>/index.html` and recommend one variant per photo, saying why.
+
+## 5. Full frame: prompts, candidates and retries
+
+Use this flow for every `--full-frame` photo (local backend only).
+
+1. **Before the run, write a per-photo `--frame-prompt`.** Look at the photo and describe what must appear in the area to fill, e.g. for an oval portrait: "his left hand resting on his right forearm, dark suit sleeve, plain dark studio backdrop". Keep the parts that matter: "Extend this photograph to fill the whole rectangular frame", "No oval, mount, border or vignette", "Keep it a black and white photograph". `--frame-prompt` applies to the whole run, so run one photo per command when each needs its own prompt; a batch of photos that need the same generic prompt can run together.
+2. **Run** with `--repair --full-frame`. Add `--frame-candidates 3` for a fill that matters (hands, faces at the edge, corners).
+3. **Review** `28-frame-overlay.jpg` and `29-full-frame-final.jpg` against `00-original.*`. Also look at `28-full-frame-candidates.jpg` if there is one. Look for: deformed hands or faces, objects that don't belong, visible seams, a dark wedge or a light patch in a corner.
+4. **Retry automatically, without asking the user,** if the fill is wrong. Only on the local backend: a better `--frame-prompt`, `--frame-candidates 3`, and `--frame-quality high`. At most **2 retry rounds per photo**. Then pick the best candidate with `--frame-seed N` (instant: it reuses the candidates already generated, only the upscale reruns).
+5. **Ask the user before** anything that costs money (fal), and before a slow `--frame-quality high` run over many photos. Also ask when no candidate is acceptable after the retries: show `28-full-frame-candidates.jpg` and ask whether to keep one or to drop the full-frame version for that photo.
+6. **Report** per photo: which version is recommended and why, and what was retried (prompt, candidates, quality, seed).
 
 ## Performance (RTX 5080, local)
 Conservative 4–10 s, generative 15–40 s (first run loads ~30 GB of models), DDColor 5–15 s per photo.

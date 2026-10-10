@@ -58,6 +58,7 @@ uv run skills/restore-photos/scripts/restore.py doctor --backend local
 uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --generative --out restored
 uv run skills/restore-photos/scripts/restore.py run photo.jpg --colorize --tone neutral --backend fal
 uv run skills/restore-photos/scripts/restore.py run portrait.jpg --full-frame --out restored  # without the mount or vignette
+uv run skills/restore-photos/scripts/restore.py run portrait.jpg --full-frame --frame-candidates 3 --frame-quality high  # pick a fill with --frame-seed
 ```
 
 `run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--saturation`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo and only rerun when their input or settings change, so retoning or rerunning is instant.
