@@ -677,3 +677,92 @@ def test_fal_refuses_the_turbo_model(monkeypatch):
     assert any("local only" in p for p in problems)
     assert restore.FalBackend(qwen="2511").check(["generative"]) == []
 
+
+
+def test_the_default_model_still_inpaints_the_frame_in_place_with_the_same_call_and_key(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    seen = []
+
+    def repair(path, mask, prompt, seed, megapixels, quality="fast"):
+        img = restore.read_image(path)
+        seen.append((prompt, seed, megapixels, quality, restore.read_mask(mask, img.shape[:2]).any()))
+        return b._echo("repair", path)
+
+    b.repair = repair
+    b.generative = lambda path, prompt, *a: seen.append(("generative", prompt)) or b._echo("generative", path)
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, full_frame=True, colorize=False))
+    assert b.calls == ["conservative", "generative", "repair", "conservative"]
+    assert seen == [("generative", "p"), ("f", 42, 1.0, "fast", True)]  # the fill is a masked repair, not an edit
+    keys = json.loads((tmp_path / "out" / "card" / "stages.json").read_text(encoding="utf-8"))
+    key = keys["28-full-frame-raw-s42.png"]
+    box, _ = restore.picture_region(restore.read_image(src))
+    assert {k: v for k, v in key.items() if k != "inputs"} == {"backend": "fake", "prompt": "f", "seed": 42,
+                                                                "megapixels": 1.0, "rect": list(box), "quality": "fast"}
+    assert len(key["inputs"]) == 2  # the base and the frame mask
+    # and the graph it sends is still the 2511 repair graph, untouched
+    cb, sent = captured_backend("2511")
+    cb.repair(src, src, "f", 42, 1.0)
+    assert [n["class_type"] for n in sent[0].values()] == [n["class_type"] for n in restore.load_workflow("repair").values()]
+    assert unet(sent[0]) == "qwen_image_edit_2511_fp8mixed.safetensors"
+
+
+def test_turbo_edits_a_prefilled_rectangle_and_takes_only_the_fill_from_it(tmp_path):
+    img = vignette_card()
+    src = tmp_path / "card.png"
+    restore.write_image(src, img)
+    b = FakeBackend()
+    seen = []
+
+    def generative(path, prompt, seed, megapixels):
+        b.calls.append("generative")
+        seen.append((prompt, seed, restore.read_image(path)))
+        out = restore.read_image(path).astype(int) + 12  # the model renders everything a bit lighter
+        return png(np.clip(out, 0, 255).astype(np.uint8))
+
+    b.generative = generative
+    b.repair = lambda *a, **k: pytest.fail("turbo must not inpaint the frame with its reference in view")
+    restore.restore_one(src, tmp_path / "out", b, args(generative=False, full_frame=True, colorize=False, qwen_model="turbo"))
+    assert b.calls == ["conservative", "generative", "generative", "conservative"]
+    (x0, y0, x1, y1), fill = restore.picture_region(img)
+    crop, m = img[y0:y1, x0:x1], fill[y0:y1, x0:x1] > 0
+    prompt, seed, pre = seen[1]
+    assert (prompt, seed) == ("f", 42) and pre.shape == crop.shape  # the frame prompt, on the rectangle alone
+    mount = np.abs(pre.astype(int) - [200, 215, 225]).sum(axis=2) < 15
+    assert not (mount & m).any()  # the pre-filled copy shows the model no cream mount in the fill
+    assert np.array_equal(pre[~m], crop[~m])  # and the picture itself
+    raw = restore.read_image(tmp_path / "out" / "card" / "28-full-frame-raw.png")
+    assert np.array_equal(raw[~m], crop[~m])  # the kept picture is bit for bit the original's
+    assert not np.array_equal(raw[m], crop[m])
+    # the edit's lightness is matched to the kept picture: the fill continues it instead of stepping up by 12
+    L = restore.to_lab(raw)[..., 0]
+    dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 5)
+    deep = (dist > 0.01 * 600 + 2) & (dist < 0.02 * 600)  # past the ramp, near the boundary
+    assert abs(np.median(L[deep]) - np.median(restore.to_lab(crop)[..., 0][~m])) < 1.0
+    keys = json.loads((tmp_path / "out" / "card" / "stages.json").read_text(encoding="utf-8"))
+    assert keys["28-full-frame-raw-s42.png"]["qwen"] == "turbo"
+    assert keys["28-full-frame-raw-s42.png"]["fill"] == "prefilled-edit"  # an earlier turbo inpaint is never reused
+
+
+def test_turbo_leaves_a_card_on_a_bed_to_the_generative_corners(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, bed_card())
+    b = FakeBackend()
+    b.generative = lambda *a: png(np.full((900, 1200, 3), 60, np.uint8))
+    b.repair = lambda *a, **k: pytest.fail("no model fill for a card on a bed")
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, generative=False, qwen_model="turbo"))
+    assert b.calls == ["conservative", "conservative"]  # the generative variant and the upscale; no fill call
+    keys = json.loads((tmp_path / "out" / "card" / "stages.json").read_text(encoding="utf-8"))
+    assert keys["28-full-frame-raw.png"]["mode"] == "generative-corners"
+
+
+def test_match_luminance_removes_the_step_along_the_fill_and_keeps_the_gradient_beyond_it():
+    base = np.full((200, 200, 3), 90, np.uint8)
+    fill = np.zeros((200, 200), np.uint8)
+    fill[:, 120:] = 255
+    gen = np.clip(base.astype(int) + 20, 0, 255).astype(np.uint8)  # rendered lighter everywhere
+    out = restore.match_luminance(gen, base, fill, band=10)
+    L = restore.to_lab(out)[..., 0]
+    assert abs(L[:, 125:140].mean() - restore.to_lab(base)[..., 0].mean()) < 0.5  # continues the base at the boundary
+    assert abs(L[:, 190:].mean() - L[:, 125:140].mean()) < 0.5  # a flat shift stays flat deep in the fill

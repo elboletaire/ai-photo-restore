@@ -804,6 +804,82 @@ def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) 
     return cv2.imencode(".png", img)[1].tobytes()
 
 
+TURBO_BAND = 0.02  # share of the long side: the band of kept picture along the fill where the Turbo edit is matched to it
+TURBO_RAMP = 0.01  # share of the long side: the Turbo fill ramps in from the kept picture over this width
+
+
+def prefill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """The masked area replaced by a smooth continuation of its surroundings (Telea at quarter size, blurred).
+
+    An edit model copies what it sees: shown the cream mount, it paints the mount back. Shown a plausible backdrop,
+    it continues the picture.
+    """
+    h, w = img.shape[:2]
+    m = (mask > 0).astype(np.uint8) * 255
+    small = cv2.resize(img, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
+    ms = cv2.resize(m, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
+    big = cv2.resize(cv2.inpaint(small, ms, 5, cv2.INPAINT_TELEA), (w, h), interpolation=cv2.INTER_CUBIC)
+    big = cv2.GaussianBlur(big, (0, 0), 6)
+    out = img.copy()
+    out[m > 0] = big[m > 0]
+    return out
+
+
+def smooth_field(values: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarray:
+    """A smooth field from weighted samples (normalized convolution): fine where there are samples, coarser away
+    from them, so it extrapolates into the unsampled area instead of falling to zero."""
+    out = None
+    for s in [sigma * 16, sigma * 8, sigma * 4, sigma * 2, sigma]:
+        num = cv2.GaussianBlur(values * weight, (0, 0), s)
+        den = cv2.GaussianBlur(weight, (0, 0), s)
+        f = num / np.maximum(den, 1e-6)
+        out = f if out is None else np.where(den > 0.05, f, out)
+    return out
+
+
+def match_luminance(gen: np.ndarray, base: np.ndarray, fill: np.ndarray, band: int) -> np.ndarray:
+    """`gen`, a whole-image edit of `base`, with its lightness shifted by a smooth field so that it continues the
+    kept picture across the fill's boundary: the model renders the backdrop a few L lighter or darker than the
+    print, and the step along the oval reads as a ring. The shift is measured where both show the same thing, the
+    band of kept picture `band` px inside the fill's boundary, and extrapolated into the fill."""
+    lab = to_lab(gen)
+    kept = (fill == 0).astype(np.uint8)
+    inward = cv2.distanceTransform(kept, cv2.DIST_L2, 5)
+    where = ((inward > 0) & (inward <= band)).astype(np.float32)
+    shift = smooth_field(to_lab(base)[..., 0] - lab[..., 0], where, float(band))
+    lab[..., 0] = np.clip(lab[..., 0] + shift, 0, 100)
+    return from_lab(lab)
+
+
+def turbo_full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) -> bytes:
+    """Like full_frame, for Qwen-Image-2.1-Turbo, whose masked inpaint copies the mount it sees in its reference.
+
+    The whole rectangle is edited at once from a pre-filled copy (the mount replaced by a continuation of the
+    picture), the edit is aligned to the rectangle, matched to the kept picture's lightness along the fill's
+    boundary, and only the fill is taken from it, ramping in from the kept picture. Outside the ramp the picture
+    is kept bit for bit.
+    """
+    x0, y0, x1, y1 = box
+    whole = read_image(base)
+    img, m, long = whole[y0:y1, x0:x1], fill[y0:y1, x0:x1], max(whole.shape[:2])
+    if not m.any():
+        return cv2.imencode(".png", img)[1].tobytes()
+    pre = prefill(img, m)
+    with tempfile.TemporaryDirectory() as tmp:
+        pre_path = Path(tmp) / "prefilled.png"
+        write_image(pre_path, pre)
+        gen = cv2.imdecode(np.frombuffer(backend.generative(pre_path, a.frame_prompt, seed, a.megapixels), np.uint8),
+                           cv2.IMREAD_COLOR)
+    gen = tone_match(match_luminance(align_to(gen, pre), img, m, max(8, round(TURBO_BAND * long))), img)
+    dist = cv2.distanceTransform((m > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = (np.clip(dist / max(4, round(TURBO_RAMP * long)), 0, 1) * (m > 0))[..., None]
+    out = (img * (1 - alpha) + gen * alpha + 0.5).astype(np.uint8)
+    med = cv2.medianBlur(out, 5)  # the same speck filter as full_frame
+    speck = (cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(int) - cv2.cvtColor(med, cv2.COLOR_BGR2GRAY) > 20) & (m > 0)
+    out[speck] = med[speck]
+    return cv2.imencode(".png", out)[1].tobytes()
+
+
 def frame_overlay(img: np.ndarray, box: tuple, fill: np.ndarray) -> np.ndarray:
     """The frame rectangle in green, the area the model will fill in red."""
     out = damage_overlay(img, fill)
@@ -909,12 +985,17 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
             elif frame_seed not in seeds:
                 seeds.append(frame_seed)
             candidates = []
+            # Turbo edits the whole rectangle from a pre-filled copy (its masked inpaint copies the mount it sees);
+            # 2511 inpaints the fill in place. The key tells them apart so an earlier Turbo fill is not reused.
+            turbo = a.qwen_model == "turbo"
+            fill_frame = turbo_full_frame if turbo else full_frame
+            how = "edits the pre-filled rectangle" if turbo else "fills the rectangle"
             for seed in seeds:
                 raw = d / f"28-full-frame-raw-s{seed}.png"
-                stage(raw, f"full frame, seed {seed} ({QWEN_NAMES[a.qwen_model]}, fills the rectangle)", [base, frame_mask],
+                stage(raw, f"full frame, seed {seed} ({QWEN_NAMES[a.qwen_model]}, {how})", [base, frame_mask],
                       {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
-                       "rect": box, "quality": a.frame_quality, **qwen_key(a)}, a.force,
-                      lambda seed=seed: full_frame(backend, base, box, fill, a, seed))
+                       "rect": box, "quality": a.frame_quality, **qwen_key(a), **({"fill": "prefilled-edit"} if turbo else {})},
+                      a.force, lambda seed=seed: fill_frame(backend, base, box, fill, a, seed))
                 candidates.append((seed, raw))
             if len(candidates) > 1:
                 candidate_sheet([(seed, raw) for seed, raw in candidates if seed in seeds[:a.frame_candidates]],
