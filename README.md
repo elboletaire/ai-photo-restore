@@ -2,7 +2,7 @@
 
 # photo-restore
 
-*An agent skill to restore, repair and colorize old family photographs*
+*A ComfyUI pipeline to restore, repair and colorize old family photographs*
 
 [![Agent Skill](https://img.shields.io/badge/Agent-Skill-d97757?style=flat-square)](https://skills.sh)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab?style=flat-square)](https://www.python.org)
@@ -13,7 +13,7 @@
 
 </div>
 
-An agent skill that brings old photographs back: it fills holes and peeled emulsion, removes stains and scratches, sharpens faces, upscales, removes worn borders and oval mounts, and optionally colorizes. Your coding agent (Claude Code, Codex, GitHub Copilot, OpenCode and others) looks at each photo first, picks the settings, runs the pipeline, and compares every result with the original before recommending one. The pipeline is a plain Python script, so you can also run it without an agent.
+A photo restoration pipeline for ComfyUI that brings old photographs back: it fills holes and peeled emulsion, removes stains and scratches, sharpens faces, upscales, removes worn borders and oval mounts, and optionally colorizes. Run it yourself, or let a coding agent (Claude Code, Codex, GitHub Copilot, OpenCode and others) drive it: the agent looks at each photo first, picks the settings, runs the pipeline, and compares every result with the original before recommending one.
 
 It runs **locally** on your GPU through [ComfyUI](https://github.com/Comfy-Org/ComfyUI), or **in the cloud** through [fal.ai](https://fal.ai). Your originals are never modified.
 
