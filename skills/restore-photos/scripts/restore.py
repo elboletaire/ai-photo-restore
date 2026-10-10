@@ -55,6 +55,22 @@ RESTORE_PROMPT = (
     "Recover sharp natural detail and clean tonal range. Keep the exact same people, faces, "
     "expressions, pose, clothing, framing and composition. Keep it a black and white photograph."
 )
+# Qwen-Image-2.1-Turbo edits literally: told to "restore", it reproduces the print's grain, paper, faded contrast and
+# worn card edge. It needs to be told what a restored photograph looks like, in detail.
+TURBO_RESTORE_PROMPT = (
+    "Restore this old photograph into a crisp, clean, professionally restored studio photograph. Remove all film grain, "
+    "paper texture, scratches, dust, stains, creases, tears and peeled patches. Restore the full tonal range: deep but "
+    "detailed blacks in the dark clothing, clean bright highlights, smooth natural midtones, strong contrast. Sharp "
+    "natural detail in the faces, hair, clothing, furniture and background. Do not reproduce the worn edges, torn "
+    "corners or the scanner background around the print: the photograph fills the whole frame edge to edge. "
+    "Keep the exact same people, faces, expressions, pose, clothing, framing and composition. "
+    "Keep it a black and white photograph."
+)
+
+
+def default_prompt(qwen: str) -> str:
+    """The generative instruction of a Qwen model when --prompt is not given."""
+    return TURBO_RESTORE_PROMPT if qwen == "turbo" else RESTORE_PROMPT
 
 
 # ---------------------------------------------------------------- image helpers
@@ -163,6 +179,22 @@ def plausible_warp(warp: np.ndarray, shape: tuple) -> bool:
     return bool(abs(a[0, 0] - 1) <= ALIGN_SCALE and abs(a[1, 1] - 1) <= ALIGN_SCALE
                 and abs(a[0, 1]) <= ALIGN_SHEAR and abs(a[1, 0]) <= ALIGN_SHEAR
                 and abs(warp[0, 2]) <= ALIGN_SHIFT * w and abs(warp[1, 2]) <= ALIGN_SHIFT * h)
+
+
+def clean_print(img: np.ndarray) -> np.ndarray:
+    """The scan with its grain softened (non-local means on L) and its lightness stretched to the full range.
+
+    What Turbo sees it copies: less paper texture and a normal contrast in its input leave less of the old print's
+    look in its output. The 2511 path does not use it.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    lab[..., 0] = cv2.fastNlMeansDenoising(lab[..., 0], None, 7, 7, 21)
+    out = to_lab(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
+    L = out[..., 0]
+    lo, hi = np.percentile(L, [0.3, 99.7])
+    if hi - lo > 1:
+        out[..., 0] = np.clip((L - lo) / (hi - lo) * 100.0, 0, 100)
+    return from_lab(out)
 
 
 def align_to(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
@@ -693,6 +725,14 @@ def inpaint(backend, img: np.ndarray, mask: np.ndarray, prompt: str, a, box=None
     return result
 
 
+def turbo_generative(backend, original: Path, prompt: str, a) -> bytes:
+    """The Turbo generative restoration: the model edits a cleaned copy of the scan (see clean_print)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cleaned = Path(tmp) / "cleaned.png"
+        write_image(cleaned, clean_print(read_image(original)))
+        return backend.generative(cleaned, prompt, a.seed, a.megapixels)
+
+
 def repair_damage(backend, original: Path, mask: Path, a) -> bytes:
     """Regenerate only the damaged areas, see inpaint."""
     img = read_image(original)
@@ -940,9 +980,15 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
     color_base = conservative
     if a.generative or a.repair or a.full_frame:  # the repair finds the damage, a full frame takes its corners
         generative = d / "20-generative.png"
-        stage(generative, f"generative ({QWEN_NAMES[a.qwen_model]})", [original],
-              {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels, **qwen_key(a)}, a.force,
-              lambda: backend.generative(original, a.prompt, a.seed, a.megapixels))
+        prompt = a.prompt if a.prompt is not None else default_prompt(a.qwen_model)
+        if a.qwen_model == "turbo":  # Turbo edits a cleaned scan; the key says so, an earlier plain edit is not reused
+            stage(generative, f"generative ({QWEN_NAMES[a.qwen_model]}, cleaned scan)", [original],
+                  {"backend": backend.name, "prompt": prompt, "seed": a.seed, "megapixels": a.megapixels, **qwen_key(a),
+                   "input": "cleaned"}, a.force, lambda: turbo_generative(backend, original, prompt, a))
+        else:
+            stage(generative, f"generative ({QWEN_NAMES[a.qwen_model]})", [original],
+                  {"backend": backend.name, "prompt": prompt, "seed": a.seed, "megapixels": a.megapixels, **qwen_key(a)}, a.force,
+                  lambda: backend.generative(original, prompt, a.seed, a.megapixels))
     if a.generative or a.repair:
         variants.append((generative, a.tone))
         color_base = generative
@@ -1074,6 +1120,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 def cmd_run(a) -> int:
     backend = make_backend(a.backend, a.qwen_model)
+    if a.prompt is None:
+        a.prompt = default_prompt(a.qwen_model)
     if a.qwen_model == "turbo" and a.frame_quality == "high":
         print("· --frame-quality high does not apply to --qwen-model turbo (fixed 8 steps): using fast")
         a.frame_quality = "fast"
@@ -1290,7 +1338,8 @@ def main() -> int:
     r.add_argument("--fidelity", type=float, default=0.7, help="CodeFormer fidelity 0..1 (higher = closer to original)")
     r.add_argument("--no-upscale", action="store_true", help="skip the x2 upscale before face restoration")
     r.add_argument("--generative", action="store_true", help="add a Qwen-Image-Edit restoration variant")
-    r.add_argument("--prompt", default=RESTORE_PROMPT, help="generative restoration prompt")
+    r.add_argument("--prompt", help="generative restoration prompt (default: one per Qwen model; "
+                                    "with turbo, a detailed per-photo description helps, see SKILL.md)")
     r.add_argument("--seed", type=int, default=42)
     r.add_argument("--frame-seed", type=int, help="seed of the full-frame fill only (default: --seed); "
                                                   "rerolls a bad fill without rerunning the other AI stages")

@@ -794,3 +794,50 @@ def test_align_to_drops_a_wild_warp_and_keeps_the_plain_resize(monkeypatch):
     fine = np.array([[1.01, 0.0, 2.0], [0.0, 0.99, -3.0]], np.float32)
     monkeypatch.setattr(restore.cv2, "findTransformECC", lambda *a, **k: (1.0, fine.copy()))
     assert not np.array_equal(restore.align_to(img, ref), out)  # a small warp is applied
+
+
+def test_turbo_generative_edits_a_cleaned_scan_with_its_own_prompt_and_the_default_does_not(photo, tmp_path):
+    seen = []
+
+    class Watch(FakeBackend):
+        def generative(self, path, prompt, seed, megapixels):
+            seen.append((restore.read_image(path), prompt))
+            return self._echo("generative", path)
+
+    img = (np.random.default_rng(3).random((64, 48, 3)) * 80 + 60).astype(np.uint8)  # a faded, grainy print
+    restore.write_image(photo, img)
+    b = Watch()
+    restore.restore_one(photo, tmp_path / "a", b, args(generative=True, colorize=False, prompt=None))
+    restore.restore_one(photo, tmp_path / "b", b, args(generative=True, colorize=False, prompt=None, qwen_model="turbo"))
+    (sent_2511, prompt_2511), (sent_turbo, prompt_turbo) = seen
+    assert prompt_2511 == restore.RESTORE_PROMPT and prompt_turbo == restore.TURBO_RESTORE_PROMPT
+    assert np.array_equal(sent_2511, restore.read_image(photo))  # 2511 gets the scan itself
+    assert sent_turbo.shape == sent_2511.shape and not np.array_equal(sent_turbo, sent_2511)
+    assert np.array_equal(sent_turbo, restore.clean_print(restore.read_image(photo)))  # turbo gets the cleaned scan
+    keys_2511 = json.loads((tmp_path / "a" / photo.stem / "stages.json").read_text(encoding="utf-8"))["20-generative.png"]
+    keys_turbo = json.loads((tmp_path / "b" / photo.stem / "stages.json").read_text(encoding="utf-8"))["20-generative.png"]
+    assert set(keys_2511) == {"backend", "prompt", "seed", "megapixels", "inputs"}  # the 2511 key is as it was
+    assert keys_turbo["input"] == "cleaned" and keys_turbo["qwen"] == "turbo"  # an earlier turbo edit is never reused
+    assert keys_turbo["prompt"] == restore.TURBO_RESTORE_PROMPT
+
+
+def test_a_user_prompt_reaches_the_turbo_generative_stage(photo, tmp_path):
+    prompts = []
+    b = FakeBackend()
+    b.generative = lambda path, prompt, *a: prompts.append(prompt) or b._echo("generative", path)
+    restore.restore_one(photo, tmp_path / "out", b, args(generative=True, colorize=False, prompt="a woman by a chair",
+                                                         qwen_model="turbo"))
+    assert prompts == ["a woman by a chair"]
+    assert json.loads((tmp_path / "out" / photo.stem / "manifest.json").read_text(encoding="utf-8"))["prompt"] == "a woman by a chair"
+
+
+def test_clean_print_softens_the_grain_and_stretches_the_lightness():
+    rng = np.random.default_rng(5)
+    faded = np.repeat(np.linspace(70, 170, 120)[None, :, None], 120, axis=0).repeat(3, axis=2)  # a faded ramp
+    img = np.clip(faded + rng.normal(0, 6, (120, 120, 1)), 0, 255).astype(np.uint8)  # with grain
+    out = restore.clean_print(img)
+    assert out.shape == img.shape
+    fine = lambda i: (restore.to_lab(i)[..., 0] - cv2.GaussianBlur(restore.to_lab(i)[..., 0], (0, 0), 1.5)).std()
+    assert fine(out) < 0.5 * fine(img)  # the grain is softened
+    L = restore.to_lab(out)[..., 0]
+    assert np.percentile(L, 0.3) < 2 and np.percentile(L, 99.7) > 98  # and the range is stretched to the full scale
