@@ -460,3 +460,18 @@ def test_high_quality_drops_the_lightning_lora_and_samples_with_guidance(monkeyp
     aura = next(n for n in wf.values() if n["class_type"] == "ModelSamplingAuraFlow")
     unet = next(k for k, n in wf.items() if n["class_type"] == "UNETLoader")
     assert aura["inputs"]["model"][0] == unet  # the model now comes straight from the UNET
+
+
+def test_full_frame_figures_compare_with_the_original_cropped_to_the_frame(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    b.repair = lambda path, *a: b._echo("repair", path)
+    b.colorize = lambda path: b._echo("colorize", path)
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=True))
+    page = restore.write_sheet(tmp_path / "out").read_text(encoding="utf-8")
+    assert 'class="before" src="card/28-original-frame.jpg"' in page  # full frame, and its colour version
+    assert page.count('class="before" src="card/28-original-frame.jpg"') == 2
+    assert 'class="before" src="card/00-original.png"' in page  # the other variants keep the whole original
+    cropped = restore.read_image(tmp_path / "out" / "card" / "28-original-frame.jpg")
+    assert cropped.shape[:2] != restore.read_image(src).shape[:2]

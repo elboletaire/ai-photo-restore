@@ -783,6 +783,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         user_fill = read_mask(Path(a.frame_mask).expanduser(), base_img.shape[:2]) if a.frame_mask else None
         box, fill = picture_region(base_img, a.frame, user_fill)
         write_image(d / "28-frame-overlay.jpg", frame_overlay(base_img, box, fill))
+        x0, y0, x1, y1 = box  # the original in the same rectangle: the "before" of the full-frame comparisons
+        write_image(d / "28-original-frame.jpg", read_image(original)[y0:y1, x0:x1])
         bw, bh = box[2] - box[0], box[3] - box[1]
         kept = bw * bh / (base_img.shape[0] * base_img.shape[1])
         source = "from --frame" if a.frame else "from --frame-mask" if a.frame_mask else "detected"
@@ -972,6 +974,7 @@ def cmd_setup_local(a) -> int:
 
 # ---------------------------------------------------------------- comparison page
 
+FULL_FRAME_VARIANTS = {"29-full-frame-final.jpg", "32-full-frame-color-final.jpg"}
 LABELS = {"10-conservative-final.jpg": "Conservative", "20-generative-final.jpg": "Generative",
           "27-repaired-final.jpg": "Repaired", "29-full-frame-final.jpg": "Full frame",
           "30-color-final.jpg": "Colorized", "31-repaired-color-final.jpg": "Repaired, colorized",
@@ -988,8 +991,10 @@ def write_sheet(out_root: Path) -> Path:
         cells = [f'<figure><img src="{src(original)}" alt="Original"><figcaption>Original</figcaption></figure>']
         for f, label in LABELS.items():
             if (d / f).exists():
+                # Full-frame variants are cropped to their rectangle: compare them with the original in that rectangle.
+                before = "28-original-frame.jpg" if f in FULL_FRAME_VARIANTS and (d / "28-original-frame.jpg").exists() else original
                 cells.append(f"""<figure><div class="cmp" style="--pos:50%">
-<img src="{src(f)}" alt="{label}"><img class="before" src="{src(original)}" alt="Original">
+<img src="{src(f)}" alt="{label}"><img class="before" src="{src(before)}" alt="Original">
 <input type="range" min="0" max="100" value="50" aria-label="Compare with original"></div>
 <figcaption>{label} <a href="{src(f)}" target="_blank">open</a></figcaption></figure>""")
             if f == "29-full-frame-final.jpg" and (d / "28-full-frame-candidates.jpg").exists():
@@ -1010,7 +1015,7 @@ figure img {{ display:block; width:100%; height:auto; border-radius:4px; }}
 figcaption {{ color:var(--muted); font-size:13px; padding-top:6px; display:flex; justify-content:space-between; }}
 figcaption a {{ color:inherit; }}
 .cmp {{ position:relative; }}
-.cmp .before {{ position:absolute; inset:0; height:100%; object-fit:fill; clip-path:inset(0 calc(100% - var(--pos)) 0 0); }}
+.cmp .before {{ position:absolute; inset:0; height:100%; object-fit:cover; clip-path:inset(0 calc(100% - var(--pos)) 0 0); }}
 .cmp::after {{ content:""; position:absolute; top:0; bottom:0; left:var(--pos); width:2px; background:#fff8; pointer-events:none; }}
 .cmp input {{ position:absolute; inset:0; width:100%; height:100%; margin:0; opacity:0; cursor:ew-resize; }}
 </style></head><body>
