@@ -1,93 +1,145 @@
+<div align="center">
+
 # photo-restore
 
-A [Claude Code](https://claude.com/claude-code) plugin that restores old photographs: removes scratches, stains and tears, sharpens faces, upscales, and optionally colorizes. Claude looks at each photo, picks the settings, runs the pipeline, and checks the result against the original before showing it to you.
+*Restore, repair and colorize old family photographs with Claude Code*
 
-It runs **locally** on your GPU through [ComfyUI](https://github.com/Comfy-Org/ComfyUI), or **in the cloud** through [fal.ai](https://fal.ai). Both use the same model families, so results are comparable.
+[![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-d97757?style=flat-square)](https://claude.com/claude-code)
+[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab?style=flat-square)](https://www.python.org)
+[![uv](https://img.shields.io/badge/runs_with-uv-de5fe9?style=flat-square)](https://docs.astral.sh/uv/)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
-## What it does
+[Examples](#examples) • [Variants](#what-you-get) • [Installation](#installation) • [Usage](#usage) • [Models and hardware](#models-and-hardware)
 
-For every photo you get up to four variants, each one finished and compared with the original on a single page (`restored/index.html`, with before/after sliders):
+</div>
 
-| Variant | Models | Good for |
+A [Claude Code](https://claude.com/claude-code) plugin that brings old photographs back: it fills holes and peeled emulsion, removes stains and scratches, sharpens faces, upscales, removes worn borders and oval mounts, and optionally colorizes. Claude looks at each photo first, picks the settings, runs the pipeline, and compares every result with the original before recommending one.
+
+It runs **locally** on your GPU through [ComfyUI](https://github.com/Comfy-Org/ComfyUI), or **in the cloud** through [fal.ai](https://fal.ai). Your originals are never modified.
+
+## Examples
+
+The three photos in [examples/](examples) are real family photos from the early 1900s, published with permission. Each one has a different kind of damage.
+
+**Heavy emulsion loss, worn and missing corners**
+
+| Original | Repaired | Full frame | Generative (Turbo) | Full frame, colorized |
+|:---:|:---:|:---:|:---:|:---:|
+| <img src="examples/francesca-ma-osa-grau.jpg" width="170"> | <img src="examples/results/francesca-repaired.jpg" width="170"> | <img src="examples/results/francesca-full-frame.jpg" width="170"> | <img src="examples/results/francesca-turbo-generative.jpg" width="170"> | <img src="examples/results/francesca-colorized.jpg" width="170"> |
+
+**Tear, foxing, faded contrast**
+
+| Original | Repaired | Generative | Generative (Turbo) | Colorized |
+|:---:|:---:|:---:|:---:|:---:|
+| <img src="examples/lluis-casajuana.jpg" width="170"> | <img src="examples/results/lluis-repaired.jpg" width="170"> | <img src="examples/results/lluis-generative.jpg" width="170"> | <img src="examples/results/lluis-turbo-generative.jpg" width="170"> | <img src="examples/results/lluis-colorized.jpg" width="170"> |
+
+**Oval vignette on a card mount, turned into a rectangular portrait**
+
+| Original | Full frame | Full frame (Turbo) | Full frame, colorized |
+|:---:|:---:|:---:|:---:|
+| <img src="examples/josep-casajuana.jpg" width="170"> | <img src="examples/results/josep-full-frame.jpg" width="170"> | <img src="examples/results/josep-turbo-full-frame.jpg" width="170"> | <img src="examples/results/josep-colorized.jpg" width="170"> |
+
+Every run also writes a comparison page (`restored/index.html`) with a before/after slider for each variant.
+
+## What you get
+
+Each photo gets one folder with the original, every stage, and a finished `*-final.jpg` per variant:
+
+| Variant | Option | What it does |
 |---|---|---|
-| **Conservative** (always) | RealESRGAN x2 + [CodeFormer](https://github.com/sczhou/CodeFormer) | Faithful: sharper faces and more resolution, nothing invented. Doesn't remove damage. |
-| **Generative** (`--generative`) | [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Damaged photos: tears, stains, scratches, missing corners. Can subtly alter faces, so always compare. |
-| **Repaired** (`--repair`, local only) | Qwen-Image-Edit-2511 on the damaged areas only, then RealESRGAN + CodeFormer | Holes, missing corners, peeled emulsion. Everything that isn't damaged, faces included, stays the original. |
-| **Full frame** (`--full-frame`, local only) | Qwen-Image-Edit-2511 on the missing parts, then RealESRGAN + CodeFormer | A rectangular picture with the mount, vignette and borders removed. On a card on a scanner bed the worn rim is cropped and the corners are taken from the generative variant. Keeps the picture's own proportions. |
-| **Colorized** (`--colorize`) | [DDColor](https://github.com/piddnad/DDColor) | Natural colours, keeps the original detail (only predicts colour, never changes luminance). |
+| **Conservative** | always | x2 upscale and face restoration ([Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), [CodeFormer](https://github.com/sczhou/CodeFormer)). Faithful, invents nothing, doesn't remove damage. |
+| **Generative** | `--generative` | The whole photo restored by an image-editing model. Cleanest result, but it redraws everything, faces included, so always compare. |
+| **Repaired** | `--repair` | Finds the damage (holes, peeled emulsion, stains) and regenerates only those areas. Everything else, faces included, stays the original pixels. |
+| **Full frame** | `--full-frame` | A clean rectangular picture: worn rims cropped, missing corners filled, oval mounts and vignettes extended into a full portrait. |
+| **Colorized** | `--colorize` | Natural colours with [DDColor](https://github.com/piddnad/DDColor), one per restored variant (generative or conservative, repaired, full frame). |
 
-Black-and-white and sepia results keep the print's own tint. AI restorers invent colour (blue eyes, pink skin) even on monochrome photos; the pipeline keeps only their luminance and rebuilds the tint from the original.
+Black-and-white and sepia variants keep the print's own tint: AI models invent colour (blue eyes, pink skin) even on monochrome photos, so the pipeline keeps only their lightness and rebuilds the tint from the original.
 
-Your originals are never modified.
-
-## Install
+## Installation
 
 ```
-/plugin marketplace add elboletaire/photo-restore
+/plugin marketplace add elboletaire/ai-photo-skills
 /plugin install photo-restore@photo-restore
 ```
 
-The only hard requirement is [uv](https://docs.astral.sh/uv/getting-started/installation/). It runs the pipeline script and installs its Python dependencies automatically. Works on Linux, macOS, Windows and WSL.
-
-Then pick a backend:
+The only hard requirement is [uv](https://docs.astral.sh/uv/getting-started/installation/), which runs the pipeline script and installs its Python dependencies. It works on Linux, macOS, Windows and WSL. Then pick a backend.
 
 ### Local (ComfyUI)
-- NVIDIA GPU: 12 GB+ VRAM for the generative variant, 8 GB without it. Apple Silicon works, slowly.
-- ~32 GB of disk for all models (~1 GB without the generative one). The experimental Turbo set adds ~14 GB (`setup-local --turbo`).
-- Already have ComfyUI? It can reuse it (portable, Desktop or a git checkout).
-- Photos never leave your machine.
 
-Ask Claude to *"set up the local photo restoration backend"*. It follows [setup-local.md](skills/restore-photos/references/setup-local.md): installs ComfyUI with [comfy-cli](https://github.com/Comfy-Org/comfy-cli) if needed, adds two custom nodes and downloads the models.
+Ask Claude to *"set up the local photo restoration backend"*. It follows [setup-local.md](skills/restore-photos/references/setup-local.md): installs ComfyUI with [comfy-cli](https://github.com/Comfy-Org/comfy-cli) if needed (or reuses yours: portable, Desktop or a git checkout), adds two custom nodes and downloads the models.
+
+- All variants: an NVIDIA GPU with 16 GB of VRAM and 32 GB of RAM is comfortable; about 32 GB of disk.
+- Conservative and colorized only: about 1.5 GB of models, runs on most GPUs and on Apple Silicon.
+- `--repair` and `--full-frame` are local only.
+
+> [!TIP]
+> ComfyUI can run on another machine: set `COMFY_URL=http://<host>:8188` and use a laptop with the GPU of a desktop. ComfyUI has no authentication, so keep it on your local network.
 
 ### Cloud (fal.ai)
-- No GPU needed. Roughly $0.005 per photo for the conservative variant, ~$0.04 with the generative one.
-- Photos are uploaded to fal.ai.
 
-Create a key at <https://fal.ai/dashboard/keys> and export it as `FAL_KEY`. See [setup-cloud.md](skills/restore-photos/references/setup-cloud.md).
+No GPU needed: roughly $0.005 per photo for the conservative variant and $0.04 with the generative one. Create a key at <https://fal.ai/dashboard/keys> and export it as `FAL_KEY` ([setup-cloud.md](skills/restore-photos/references/setup-cloud.md)).
 
-## Use
+> [!WARNING]
+> With the fal.ai backend your photos are uploaded to fal.ai. Use the local backend if they must stay on your machine.
 
-Just ask:
+## Usage
 
-> Restore the photos in `~/Pictures/grandparents`, they're quite damaged. Colorize the wedding one too.
+Just ask Claude:
+
+> Restore the photos in `~/Pictures/grandparents`, they're quite damaged. Remove the borders and colorize the wedding one too.
+
+Claude checks the backend, looks at each photo, runs the right variants, reviews the results (and retries bad fills on its own), then points you to the comparison page with a recommendation per photo.
 
 Or run the script yourself:
 
 ```bash
+# check the backend
 uv run skills/restore-photos/scripts/restore.py doctor --backend local
-uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --generative --out restored
+
+# damaged photos: repair only the damage, plus a generative and a colorized variant
+uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --repair --generative --colorize --out restored
+
+# a portrait in an oval mount: three fills to choose from, then pick one with --frame-seed
+uv run skills/restore-photos/scripts/restore.py run portrait.jpg --full-frame --frame-candidates 3 --out restored
+
+# cloud backend, neutral grey tone
 uv run skills/restore-photos/scripts/restore.py run photo.jpg --colorize --tone neutral --backend fal
-uv run skills/restore-photos/scripts/restore.py run portrait.jpg --full-frame --out restored  # without the mount or vignette
-uv run skills/restore-photos/scripts/restore.py run portrait.jpg --full-frame --frame-candidates 3 --frame-quality high  # pick a fill with --frame-seed
 ```
 
-`run --help` lists every option (`--fidelity`, `--tone keep|neutral|sepia`, `--saturation`, `--seed`, `--prompt`, `--no-upscale`, `--force`, ...). AI stages are cached per photo and only rerun when their input or settings change, so retoning or rerunning is instant.
+`run --help` lists every option (`--fidelity`, `--tone`, `--saturation`, `--seed`, `--prompt`, `--frame-prompt`, `--mask`, `--frame-mask`, ...). AI stages are cached per photo and only rerun when their input or settings change, so changing the tone or the colour strength is instant.
 
-## Where it works
+> [!NOTE]
+> The damage and border detection is automatic and shown as an overlay (`25-damage-overlay.jpg`, `28-frame-overlay.jpg`). When it misses something, paint a black and white mask in any editor and pass it with `--mask` or `--frame-mask`.
 
-| Client | Local backend | Cloud backend |
+## Models and hardware
+
+The generative, repaired and full-frame variants use an image-editing model. Two are available:
+
+| | Qwen-Image-Edit-2511 (default) | Qwen-Image-2.1-Turbo (`--qwen-model turbo`, experimental) |
 |---|---|---|
-| Claude Code (terminal, IDE, Desktop "Code" tab) on Linux, macOS, Windows | ✓ | ✓ |
-| Claude Desktop / claude.ai chat (skills run in Anthropic's sandbox, not on your machine) | ✗ | only if the sandbox allows network access to fal.ai |
+| Size on disk | ~30 GB | ~14 GB |
+| Speed (RTX 5080) | 25–40 s per generative image | about twice as fast |
+| Generative | crisp, but redraws faces more | keeps faces and composition closer to the original |
+| Repair and full frame | best results | weaker repair; full frame works, hands vary more by seed |
+| Licence | Apache-2.0 | Qwen Research License, non-commercial |
 
-## Layout
+Turbo is meant for smaller GPUs (roughly 10–12 GB of VRAM, untested below that) and for faster runs. Install its files with `setup-local --turbo`.
+
+> [!IMPORTANT]
+> This plugin is MIT licensed, but the models keep their own licences. **CodeFormer** ([S-Lab License 1.0](https://github.com/sczhou/CodeFormer/blob/master/LICENSE)) and **Qwen-Image-2.1-Turbo** ([Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE)) are for **non-commercial use only**. Qwen-Image-Edit-2511, its Lightning LoRA and DDColor are Apache-2.0; Real-ESRGAN is BSD-3-Clause. Restoring your own family photos is fine; review the licences before any commercial use.
+
+## Project layout
 
 ```
 .claude-plugin/          plugin and marketplace manifests
 skills/restore-photos/
-  SKILL.md               how Claude decides settings and reviews results
+  SKILL.md               how Claude chooses settings, reviews results and retries
   scripts/restore.py     the whole pipeline (run / doctor / setup-local / sheet)
-  workflows/*.json       ComfyUI API workflows. Open them in ComfyUI to tweak them, and keep the node titles.
+  workflows/*.json       ComfyUI API workflows (open them in ComfyUI to tweak; keep the node titles)
   references/            backend setup guides
-examples/                reference photos with different kinds of damage
-tests/                   pytest suite (fake backend)
+examples/                reference photos and restoration results
+tests/                   pytest suite with a fake backend
 ```
-
-## Performance
-
-On an RTX 5080: conservative 4–10 s, generative 15–40 s (the first run loads ~30 GB of models), colorization 5–15 s per photo.
-
-**Experimental: `--qwen-model turbo`** runs the generative, repair and full-frame fills on Qwen-Image-2.1-Turbo (~14 GB instead of ~30 GB, 8 steps). It was about 2x faster in our tests and keeps composition and identity better in whole-image restoration. It is weaker at repair, so compare before using it. Its generative variant uses its own, more detailed default prompt and edits a cleaned copy of the scan (grain softened, lightness stretched), because Turbo otherwise reproduces the print's grain, faded contrast and worn card edge. Its full frame edits the whole rectangle from a copy with the mount painted over (a masked inpaint with Turbo copied the oval mount back) and takes only the fill from it, matched to the picture's lightness: the backdrop comes out clean, the generated hands vary more by seed than with 2511 (`--frame-candidates 3`). Local only; `--frame-quality high` does not apply to it. Its licence is the Qwen Research License, **non-commercial use only**.
 
 ## Development
 
@@ -95,15 +147,8 @@ On an RTX 5080: conservative 4–10 s, generative 15–40 s (the first run loads
 uv run --with pytest --with numpy --with opencv-python-headless --with requests pytest
 ```
 
-The tests use a fake backend, so they need neither ComfyUI nor fal. [examples/](examples) has real damaged photos to try every pipeline on.
+The tests use a fake backend, so they need neither ComfyUI nor fal.ai. To try the real pipeline on the reference photos:
 
-## License
-
-[MIT](LICENSE) for this plugin. The models are downloaded from their authors and keep their own licenses:
-
-- **CodeFormer**: [S-Lab License 1.0](https://github.com/sczhou/CodeFormer/blob/master/LICENSE), **non-commercial use only**.
-- Qwen-Image-Edit-2511 and its Lightning LoRA, DDColor: Apache-2.0.
-- **Qwen-Image-2.1-Turbo** (`--qwen-model turbo`, experimental): [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE), **non-commercial use only**.
-- Real-ESRGAN: BSD-3-Clause.
-
-Restoring your own family photos is fine. For commercial work, review the model licenses first: CodeFormer in particular doesn't allow it.
+```bash
+uv run skills/restore-photos/scripts/restore.py run examples --repair --full-frame --colorize --out restored
+```

@@ -13,3 +13,4 @@ restored*/
 
 # Except the reference photos, published with permission (public domain).
 !examples/*.jpg
+!examples/results/*.jpg

@@ -13,3 +13,5 @@ Run them all with:
 ```bash
 uv run skills/restore-photos/scripts/restore.py run examples --repair --full-frame --colorize --out restored
 ```
+
+[results/](results) has restorations of these photos made with the pipeline, shown in the main README.
