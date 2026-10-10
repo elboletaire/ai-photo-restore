@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -35,7 +36,7 @@ class FakeBackend:
 def args(**kw):
     defaults = dict(fidelity=0.7, no_upscale=False, generative=True, prompt="p", seed=42, megapixels=1.0,
                     repair=False, mask=None, repair_prompt="r", full_frame=False, frame=None, frame_mask=None, frame_seed=None, frame_candidates=1, frame_quality="fast", frame_prompt="f",
-                    colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
+                    colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False, qwen_model="2511")
     return argparse.Namespace(**{**defaults, **kw})
 
 
@@ -573,3 +574,92 @@ def test_a_single_candidate_takes_the_explicit_seed_and_drops_a_stale_sheet(tmp_
     restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, frame_candidates=1, frame_seed=7))
     assert seeds == [7]  # only the explicit seed is generated
     assert not (tmp_path / "out" / "card" / "28-full-frame-candidates.jpg").exists()  # the stale sheet is gone
+
+
+def png(img):
+    return cv2.imencode(".png", img)[1].tobytes()
+
+
+def captured_backend(qwen):
+    """A ComfyBackend that records the workflow it would have sent, without a server."""
+    sent = []
+    b = restore.ComfyBackend(url="http://unused", qwen=qwen)
+    b._upload = lambda path: "x.png"
+    b._run = lambda wf: (sent.append(wf), png(np.full((32, 32, 3), 90, np.uint8)))[1]
+    return b, sent
+
+
+def unet(wf):
+    return next(n["inputs"]["unet_name"] for n in wf.values() if n["class_type"] == "UNETLoader")
+
+
+def test_turbo_sends_the_turbo_graphs_and_the_default_sends_2511(tmp_path):
+    img = tmp_path / "p.png"
+    restore.write_image(img, np.full((32, 32, 3), 120, np.uint8))
+    mask = tmp_path / "m.png"
+    restore.write_image(mask, np.zeros((32, 32, 3), np.uint8))
+    b, sent = captured_backend("2511")
+    b.generative(img, "p", 1, 1.0)
+    b.repair(img, mask, "p", 1, 1.0)
+    assert [unet(w) for w in sent] == ["qwen_image_edit_2511_fp8mixed.safetensors"] * 2
+    b, sent = captured_backend("turbo")
+    b.generative(img, "p", 1, 1.0)
+    b.repair(img, mask, "p", 1, 1.0, quality="high")  # no LoRA and no 20-step override on turbo
+    assert [unet(w) for w in sent] == ["qwen_image_2.1_turbo_int8_convrot.safetensors"] * 2
+    assert all(n["class_type"] != "LoraLoaderModelOnly" for n in sent[1].values())
+    sampler = sent[1][restore.find_node(sent[1], "Sampler")]
+    assert sampler["inputs"]["steps"] == 8
+
+
+def test_turbo_workflows_have_the_titles_the_backend_sets():
+    for name, titles in [("generative-turbo", ["Input image", "Prompt", "Sampler", "Scale", "Output"]),
+                         ("repair-turbo", ["Input image", "Prompt", "Sampler", "Scale", "Output", "Mask"])]:
+        wf = restore.load_workflow(name)
+        for title in titles:
+            restore.find_node(wf, title)  # raises when the title is missing
+
+
+def test_the_two_qwen_models_never_share_a_cached_stage(photo, tmp_path):
+    b = FakeBackend()
+    out = tmp_path / "out"
+    restore.restore_one(photo, out, b, args(generative=True, colorize=False, qwen_model="2511"))
+    keys = json.loads((out / photo.stem / "stages.json").read_text(encoding="utf-8"))
+    assert "qwen" not in keys["20-generative.png"]  # the default keeps its existing cache keys
+    restore.restore_one(photo, out, b, args(generative=True, colorize=False, qwen_model="turbo"))
+    assert b.calls.count("generative") == 2  # the turbo run did not reuse the 2511 file
+    keys = json.loads((out / photo.stem / "stages.json").read_text(encoding="utf-8"))
+    assert keys["20-generative.png"]["qwen"] == "turbo"
+    restore.restore_one(photo, out, b, args(generative=True, colorize=False, qwen_model="turbo"))
+    assert b.calls.count("generative") == 2  # the same model again is cached
+
+
+def test_check_asks_for_the_turbo_models_when_turbo_is_chosen(monkeypatch):
+    names = {"generative-turbo": "qwen_image_2.1_turbo_int8_convrot.safetensors"}
+    classes = set()
+    for wf in ("generative-turbo", "repair-turbo"):
+        classes |= {n["class_type"] for n in restore.load_workflow(wf).values()}
+
+    def info(installed):
+        obj = {cls: {"input": {"required": {}}} for cls in classes}
+        obj["UNETLoader"] = {"input": {"required": {"unet_name": [sorted(installed)]}}}
+        obj["CLIPLoader"] = {"input": {"required": {"clip_name": [["qwen3vl_8b_w4a8.safetensors"]]}}}
+        obj["VAELoader"] = {"input": {"required": {"vae_name": [["qwen_image_2.1_vae_bf16.safetensors"]]}}}
+
+        class Resp:
+            def json(self):
+                return obj
+        return lambda url, timeout=None: Resp()
+
+    monkeypatch.setattr(restore.requests, "get", info(["something_else.safetensors"]))
+    problems = restore.ComfyBackend(qwen="turbo").check(["generative", "repair"])
+    assert any(names["generative-turbo"] in p for p in problems)
+    monkeypatch.setattr(restore.requests, "get", info([names["generative-turbo"]]))
+    assert restore.ComfyBackend(qwen="turbo").check(["generative", "repair"]) == []
+
+
+def test_fal_refuses_the_turbo_model(monkeypatch):
+    monkeypatch.setenv("FAL_KEY", "k")
+    problems = restore.FalBackend(qwen="turbo").check(["generative"])
+    assert any("local only" in p for p in problems)
+    assert restore.FalBackend(qwen="2511").check(["generative"]) == []
+

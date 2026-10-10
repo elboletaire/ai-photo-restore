@@ -42,7 +42,7 @@ Check the GPU is visible: `python -c "import torch; print(torch.cuda.is_availabl
 uv run <skill-dir>/scripts/restore.py setup-local --comfy <ComfyUI folder> --python <ComfyUI python>
 ```
 
-It clones the `facerestore_cf` and `ComfyUI-DDColor` custom nodes, installs their requirements and downloads the models (resumable). Add `--skip-generative` to skip the ~31 GB Qwen-Image-Edit files when the GPU has < 12 GB or disk is short; then don't use `--generative` (or use the fal backend for it). Use `--models <dir>` to point at a shared models folder.
+It clones the `facerestore_cf` and `ComfyUI-DDColor` custom nodes, installs their requirements and downloads the models (resumable). Add `--turbo` to also download the experimental Qwen-Image-2.1-Turbo files (~14 GB, Qwen Research License, non-commercial use only) for `run --qwen-model turbo`. Add `--skip-generative` to skip the ~31 GB Qwen-Image-Edit files when the GPU has < 12 GB or disk is short; then don't use `--generative` (or use the fal backend for it). Use `--models <dir>` to point at a shared models folder.
 
 ## 4. Start ComfyUI
 

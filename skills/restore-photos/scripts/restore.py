@@ -400,12 +400,22 @@ def paste(original: np.ndarray, patch: np.ndarray, mask: np.ndarray, outward: bo
 
 # ---------------------------------------------------------------- backends
 
+QWEN_MODELS = ("2511", "turbo")  # --qwen-model: Qwen-Image-Edit-2511 (default) or the experimental 2.1 Turbo
+QWEN_NAMES = {"2511": "Qwen-Image-Edit-2511", "turbo": "Qwen-Image-2.1-Turbo"}
+
+
+def qwen_workflow(name: str, qwen: str) -> str:
+    """The workflow of a Qwen stage: the Turbo graph for --qwen-model turbo, else the 2511 one."""
+    return f"{name}-turbo" if qwen == "turbo" and name in ("generative", "repair") else name
+
+
 class ComfyBackend:
     name = "local"
 
-    def __init__(self, url: str | None = None):
+    def __init__(self, url: str | None = None, qwen: str = "2511"):
         self.url = (url or os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
         self.client_id = uuid.uuid4().hex
+        self.qwen = qwen
 
     def check(self, stages: list[str]) -> list[str]:
         """Problems that would stop the workflows of `stages` from running: missing nodes or models."""
@@ -414,7 +424,8 @@ class ComfyBackend:
         except requests.RequestException:
             return [f"ComfyUI not reachable at {self.url} (start it, or set COMFY_URL)"]
         problems = []
-        for wf in stages:
+        for stage_name in stages:
+            wf = qwen_workflow(stage_name, self.qwen)
             for node in load_workflow(wf).values():
                 cls = node["class_type"]
                 if cls not in info:
@@ -471,7 +482,7 @@ class ComfyBackend:
         return self._run(wf)
 
     def generative(self, path: Path, prompt: str, seed: int, megapixels: float) -> bytes:
-        wf = load_workflow("generative")
+        wf = load_workflow(qwen_workflow("generative", self.qwen))
         set_input(wf, "Input image", "image", self._upload(path))
         set_input(wf, "Prompt", "prompt", prompt)
         set_input(wf, "Sampler", "seed", seed)
@@ -479,8 +490,8 @@ class ComfyBackend:
         return self._run(wf)
 
     def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float, quality: str = "fast") -> bytes:
-        wf = load_workflow("repair")
-        if quality == "high":  # no Lightning LoRA: real guidance and more steps, slower and cleaner
+        wf = load_workflow(qwen_workflow("repair", self.qwen))
+        if quality == "high" and self.qwen == "2511":  # no Lightning LoRA: real guidance, more steps (Turbo has its own)
             bypass_class(wf, "LoraLoaderModelOnly", "model")
             set_input(wf, "Sampler", "steps", HIGH_STEPS)
             set_input(wf, "Sampler", "cfg", HIGH_CFG)
@@ -500,13 +511,16 @@ class ComfyBackend:
 class FalBackend:
     name = "fal"
 
-    def __init__(self):
+    def __init__(self, qwen: str = "2511"):
         self.key = os.environ.get("FAL_KEY", "")
+        self.qwen = qwen
 
     def check(self, stages: list[str]) -> list[str]:
         problems = [] if self.key else ["FAL_KEY is not set (create one at https://fal.ai/dashboard/keys)"]
         if "repair" in stages:
             problems.append("--repair and --full-frame only work with the local backend for now")
+        if self.qwen == "turbo":
+            problems.append("--qwen-model turbo is local only (fal runs the 2511 models)")
         return problems
 
     def _call(self, endpoint: str, payload: dict) -> bytes:
@@ -554,8 +568,8 @@ def combo_options(spec) -> list | None:
     return None
 
 
-def make_backend(name: str):
-    return ComfyBackend() if name == "local" else FalBackend()
+def make_backend(name: str, qwen: str = "2511"):
+    return ComfyBackend(qwen=qwen) if name == "local" else FalBackend(qwen=qwen)
 
 
 # ---------------------------------------------------------------- workflow helpers
@@ -610,6 +624,12 @@ def collect_inputs(args: list[str]) -> list[Path]:
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def qwen_key(a) -> dict:
+    """The Qwen model is part of a stage's key when it is not the default: a turbo file never reuses a 2511 one."""
+    qwen = getattr(a, "qwen_model", "2511")
+    return {} if qwen == "2511" else {"qwen": qwen}
 
 
 def stage(target: Path, label: str, inputs: list[Path], settings: dict, force: bool, produce) -> None:
@@ -821,8 +841,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
     color_base = conservative
     if a.generative or a.repair or a.full_frame:  # the repair finds the damage, a full frame takes its corners
         generative = d / "20-generative.png"
-        stage(generative, "generative (Qwen-Image-Edit-2511)", [original],
-              {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels}, a.force,
+        stage(generative, f"generative ({QWEN_NAMES[a.qwen_model]})", [original],
+              {"backend": backend.name, "prompt": a.prompt, "seed": a.seed, "megapixels": a.megapixels, **qwen_key(a)}, a.force,
               lambda: backend.generative(original, a.prompt, a.seed, a.megapixels))
     if a.generative or a.repair:
         variants.append((generative, a.tone))
@@ -839,8 +859,8 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         write_image(d / "25-damage-overlay.jpg", damage_overlay(orig_img, m))
         print(f"  ✓ damage mask ({'from ' + a.mask if a.mask else 'detected'}: {100 * (m > 0).mean():.1f}% of the photo)")
         repaired_raw = d / "26-repaired-raw.png"
-        stage(repaired_raw, "repair (Qwen-Image-Edit-2511, damaged areas only)", [original, mask],
-              {"backend": backend.name, "prompt": a.repair_prompt, "seed": a.seed, "megapixels": a.megapixels},
+        stage(repaired_raw, f"repair ({QWEN_NAMES[a.qwen_model]}, damaged areas only)", [original, mask],
+              {"backend": backend.name, "prompt": a.repair_prompt, "seed": a.seed, "megapixels": a.megapixels, **qwen_key(a)},
               a.force, lambda: repair_damage(backend, original, mask, a))
         repaired = d / "27-repaired.png"
         stage(repaired, "repaired: upscale + CodeFormer", [repaired_raw],
@@ -889,9 +909,9 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
             candidates = []
             for seed in seeds:
                 raw = d / f"28-full-frame-raw-s{seed}.png"
-                stage(raw, f"full frame, seed {seed} (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
+                stage(raw, f"full frame, seed {seed} ({QWEN_NAMES[a.qwen_model]}, fills the rectangle)", [base, frame_mask],
                       {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
-                       "rect": box, "quality": a.frame_quality}, a.force,
+                       "rect": box, "quality": a.frame_quality, **qwen_key(a)}, a.force,
                       lambda seed=seed: full_frame(backend, base, box, fill, a, seed))
                 candidates.append((seed, raw))
             if len(candidates) > 1:
@@ -949,7 +969,10 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
 
 
 def cmd_run(a) -> int:
-    backend = make_backend(a.backend)
+    backend = make_backend(a.backend, a.qwen_model)
+    if a.qwen_model == "turbo" and a.frame_quality == "high":
+        print("· --frame-quality high does not apply to --qwen-model turbo (fixed 8 steps): using fast")
+        a.frame_quality = "fast"
     stages = (["conservative"] + ["generative"] * (a.generative or a.repair or a.full_frame)
               + ["repair"] * (a.repair or a.full_frame)
               + ["colorize"] * a.colorize)
@@ -986,7 +1009,7 @@ def cmd_run(a) -> int:
 
 
 def cmd_doctor(a) -> int:
-    backend = make_backend(a.backend)
+    backend = make_backend(a.backend, a.qwen_model)
     failed = []
     for name, flag in (("conservative", ""), ("generative", " (--generative)"), ("repair", " (--repair, --full-frame)"),
                        ("colorize", " (--colorize)")):
@@ -1026,6 +1049,14 @@ MODELS = {
 }
 
 
+TURBO_HF = f"{HF}/Comfy-Org/Qwen-Image-2.1/resolve/main"
+TURBO_MODELS = {
+    "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors": f"{TURBO_HF}/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+    "text_encoders/qwen3vl_8b_w4a8.safetensors": f"{TURBO_HF}/text_encoders/qwen3vl_8b_w4a8.safetensors",
+    "vae/qwen_image_2.1_vae_bf16.safetensors": f"{TURBO_HF}/vae/qwen_image_2.1_vae_bf16.safetensors",
+}
+
+
 def download(url: str, dest: Path) -> None:
     part = dest.with_name(dest.name + ".part")
     done = part.stat().st_size if part.exists() else 0
@@ -1062,7 +1093,7 @@ def cmd_setup_local(a) -> int:
             subprocess.run([*cmd, "-r", str(req)], check=True)
         print(f"✓ node {name}")
     models = Path(a.models).expanduser().resolve() if a.models else comfy / "models"
-    for rel, url in MODELS.items():
+    for rel, url in {**MODELS, **(TURBO_MODELS if a.turbo else {})}.items():
         if a.skip_generative and any(s in rel for s in ("qwen", "Qwen")):
             continue
         dest = models / rel
@@ -1160,6 +1191,9 @@ def main() -> int:
     r.add_argument("--frame-seed", type=int, help="seed of the full-frame fill only (default: --seed); "
                                                   "rerolls a bad fill without rerunning the other AI stages")
     r.add_argument("--megapixels", type=float, default=1.0, help="generative working size (local backend)")
+    r.add_argument("--qwen-model", choices=QWEN_MODELS, default="2511",
+                   help="Qwen model for the generative, repair and full-frame fills: 2511 (default, Apache-2.0) or "
+                        "turbo (experimental, Qwen Research License, non-commercial; local only; needs setup-local --turbo)")
     r.add_argument("--repair", action="store_true",
                    help="add a variant that regenerates only the damaged areas (holes, peeled emulsion, stains); "
                         "implies --generative, which it uses to find the damage")
@@ -1190,6 +1224,7 @@ def main() -> int:
 
     d = sub.add_parser("doctor", help="check that a backend is ready")
     d.add_argument("--backend", choices=["local", "fal"], default=os.environ.get("RESTORE_BACKEND", "local"))
+    d.add_argument("--qwen-model", choices=QWEN_MODELS, default="2511")
     d.set_defaults(func=cmd_doctor)
 
     s = sub.add_parser("setup-local", help="install the ComfyUI nodes and models this pipeline needs")
@@ -1197,6 +1232,8 @@ def main() -> int:
     s.add_argument("--python", required=True, help="python executable of ComfyUI's environment")
     s.add_argument("--models", help="models directory (default: <comfy>/models)")
     s.add_argument("--skip-generative", action="store_true", help="skip the ~31 GB Qwen-Image-Edit models")
+    s.add_argument("--turbo", action="store_true", help="also download the experimental Qwen-Image-2.1-Turbo files "
+                                                       "(~14 GB, Qwen Research License, non-commercial)")
     s.set_defaults(func=cmd_setup_local)
 
     sh = sub.add_parser("sheet", help="rebuild the comparison page")

@@ -33,7 +33,7 @@ Then pick a backend:
 
 ### Local (ComfyUI)
 - NVIDIA GPU: 12 GB+ VRAM for the generative variant, 8 GB without it. Apple Silicon works, slowly.
-- ~32 GB of disk for all models (~1 GB without the generative one).
+- ~32 GB of disk for all models (~1 GB without the generative one). The experimental Turbo set adds ~14 GB (`setup-local --turbo`).
 - Already have ComfyUI? It can reuse it (portable, Desktop or a git checkout).
 - Photos never leave your machine.
 
@@ -87,6 +87,8 @@ tests/                   pytest suite (fake backend)
 
 On an RTX 5080: conservative 4–10 s, generative 15–40 s (the first run loads ~30 GB of models), colorization 5–15 s per photo.
 
+**Experimental: `--qwen-model turbo`** runs the generative, repair and full-frame fills on Qwen-Image-2.1-Turbo (~14 GB instead of ~30 GB, 8 steps). It was about 2x faster in our tests and keeps composition and identity better in whole-image restoration. It is weaker at repair and full frame (it tended to keep the oval), so compare before using it. Local only; `--frame-quality high` does not apply to it. Its licence is the Qwen Research License, **non-commercial use only**.
+
 ## Development
 
 ```bash
@@ -101,6 +103,7 @@ The tests use a fake backend, so they need neither ComfyUI nor fal. [examples/](
 
 - **CodeFormer**: [S-Lab License 1.0](https://github.com/sczhou/CodeFormer/blob/master/LICENSE), **non-commercial use only**.
 - Qwen-Image-Edit-2511 and its Lightning LoRA, DDColor: Apache-2.0.
+- Qwen-Image-2.1-Turbo (`--qwen-model turbo`, experimental): [Qwen Research License](https://huggingface.co/Comfy-Org/Qwen-Image-2.1), **non-commercial use only**.
 - Real-ESRGAN: BSD-3-Clause.
 
 Restoring your own family photos is fine. For commercial work, review the model licenses first: CodeFormer in particular doesn't allow it.
