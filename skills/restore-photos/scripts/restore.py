@@ -149,8 +149,27 @@ def finish(img: np.ndarray, tone: str, sharpen: bool = True, saturation: float =
     return from_lab(lab)
 
 
+# align_to: the warps generative output really needs (2511: up to 2% rescale and shift; a Turbo whole-image edit
+# zooms by up to 12% and shifts by 6%) against a wild ECC fit on a smooth area.
+ALIGN_SCALE = 0.2  # a rescale by more than this share is not an alignment
+ALIGN_SHEAR = 0.05  # nor a rotation or shear by more than this
+ALIGN_SHIFT = 0.1  # nor a shift by more than this share of the size
+
+
+def plausible_warp(warp: np.ndarray, shape: tuple) -> bool:
+    """Whether an ECC warp is the rescale and shift of a generative output, not a wild fit on a smooth area."""
+    h, w = shape[:2]
+    a = warp[:, :2]
+    return bool(abs(a[0, 0] - 1) <= ALIGN_SCALE and abs(a[1, 1] - 1) <= ALIGN_SCALE
+                and abs(a[0, 1]) <= ALIGN_SHEAR and abs(a[1, 0]) <= ALIGN_SHEAR
+                and abs(warp[0, 2]) <= ALIGN_SHIFT * w and abs(warp[1, 2]) <= ALIGN_SHIFT * h)
+
+
 def align_to(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Resize `img` to `ref`'s size and fine-align it (affine): generative output is rescaled and slightly shifted."""
+    """Resize `img` to `ref`'s size and fine-align it (affine): generative output is rescaled and slightly shifted.
+
+    A warp that is not small (ECC can converge to a wild fit) is dropped, keeping the plain resize.
+    """
     h, w = ref.shape[:2]
     img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LANCZOS4)
     s = min(1.0, 1000 / max(h, w))
@@ -162,6 +181,8 @@ def align_to(img: np.ndarray, ref: np.ndarray) -> np.ndarray:
     except cv2.error:
         return img  # didn't converge: keep the plain resize
     warp[:, 2] /= s
+    if not plausible_warp(warp, (h, w)):
+        return img
     return cv2.warpAffine(img, warp, (w, h), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
                           borderMode=cv2.BORDER_REFLECT)
 
@@ -1015,9 +1036,9 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         bases = [(color_base, d / "30-color.png")]
         if a.repair:
             bases.append((repaired, d / "31-repaired-color.png"))
-        for src, color in bases:
-            stage(color, f"colorize {src.stem} (DDColor)", [src], {"backend": backend.name}, a.force,
-                  lambda src=src: backend.colorize(src))
+        for color_src, color in bases:
+            stage(color, f"colorize {color_src.stem} (DDColor)", [color_src], {"backend": backend.name}, a.force,
+                  lambda color_src=color_src: backend.colorize(color_src))
             variants.append((color, "color"))
         if frame:
             # The frame alone looks green to DDColor (no surroundings to tell the skin and paper apart), so it is

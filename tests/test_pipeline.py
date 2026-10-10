@@ -766,3 +766,31 @@ def test_match_luminance_removes_the_step_along_the_fill_and_keeps_the_gradient_
     L = restore.to_lab(out)[..., 0]
     assert abs(L[:, 125:140].mean() - restore.to_lab(base)[..., 0].mean()) < 0.5  # continues the base at the boundary
     assert abs(L[:, 190:].mean() - L[:, 125:140].mean()) < 0.5  # a flat shift stays flat deep in the fill
+
+
+def test_manifest_records_the_scanned_photo_as_input_after_colourizing_two_bases(photo, tmp_path):
+    b = FakeBackend()
+    b.repair = lambda path, *a, **k: b._echo("repair", path)
+    restore.restore_one(photo, tmp_path / "out", b, args(generative=False, repair=True, colorize=True))
+    manifest = json.loads((tmp_path / "out" / photo.stem / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["input"] == str(photo)  # not the last colourized base (27-repaired.png)
+    assert (tmp_path / "out" / photo.stem / "31-repaired-color.png").exists()  # two bases were coloured
+
+
+def test_align_to_drops_a_wild_warp_and_keeps_the_plain_resize(monkeypatch):
+    small = np.eye(2, 3, dtype=np.float32)
+    small[0, 0], small[1, 1], small[0, 2], small[1, 2] = 0.88, 0.9, 36.0, -58.0  # a Turbo edit: 12% zoom, 6% shift on 600x1000
+    assert restore.plausible_warp(small, (1000, 600))
+    for i, j, v in [(0, 0, 1.3), (1, 1, 0.7), (0, 1, 0.1), (1, 0, -0.1), (0, 2, 80.0), (1, 2, -150.0)]:
+        wild = np.eye(2, 3, dtype=np.float32)
+        wild[i, j] = v
+        assert not restore.plausible_warp(wild, (1000, 600)), (i, j, v)
+    ref = (np.random.default_rng(1).random((300, 200, 3)) * 255).astype(np.uint8)
+    img = (np.random.default_rng(2).random((150, 100, 3)) * 255).astype(np.uint8)
+    wild = np.array([[1.3, 0.0, 0.0], [0.0, 1.0, 80.0]], np.float32)
+    monkeypatch.setattr(restore.cv2, "findTransformECC", lambda *a, **k: (1.0, wild))
+    out = restore.align_to(img, ref)
+    assert np.array_equal(out, cv2.resize(img, (200, 300), interpolation=cv2.INTER_LANCZOS4))
+    fine = np.array([[1.01, 0.0, 2.0], [0.0, 0.99, -3.0]], np.float32)
+    monkeypatch.setattr(restore.cv2, "findTransformECC", lambda *a, **k: (1.0, fine.copy()))
+    assert not np.array_equal(restore.align_to(img, ref), out)  # a small warp is applied
