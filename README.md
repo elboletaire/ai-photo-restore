@@ -9,7 +9,7 @@
 [![uv](https://img.shields.io/badge/runs_with-uv-de5fe9?style=flat-square)](https://docs.astral.sh/uv/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
-[Examples](#examples) • [Variants](#what-you-get) • [Installation](#installation) • [Usage](#usage) • [Models and hardware](#models-and-hardware)
+[Examples](#examples) • [Variants](#what-you-get) • [Installation](#installation) • [Usage](#usage) • [Without an agent](#without-an-agent) • [Models and hardware](#models-and-hardware)
 
 </div>
 
@@ -57,7 +57,7 @@ Black-and-white and sepia variants keep the print's own tint: AI models invent c
 
 ## Installation
 
-Install the skill for your agent with [skills](https://skills.sh):
+Install the skill for your agent with [skills](https://skills.sh) (not using an agent? See [Without an agent](#without-an-agent)):
 
 ```bash
 npx skills add https://github.com/elboletaire/ai-photo-restore --skill restore-photos
@@ -118,6 +118,35 @@ uv run skills/restore-photos/scripts/restore.py run photo.jpg --colorize --tone 
 
 > [!NOTE]
 > The damage and border detection is automatic and shown as an overlay (`25-damage-overlay.jpg`, `28-frame-overlay.jpg`). When it misses something, paint a black and white mask in any editor and pass it with `--mask` or `--frame-mask`.
+
+## Without an agent
+
+The agent only drives a Python script that talks to ComfyUI, so you can do everything by hand. Read [SKILL.md](skills/restore-photos/SKILL.md) as the manual: it explains which options suit which kind of damage and what to check in the results, and `run --help` lists every option. [setup-local.md](skills/restore-photos/references/setup-local.md) has the ComfyUI install commands for Linux, macOS and Windows.
+
+A complete run on Linux or macOS, with ComfyUI installed in `~/comfy` as in setup-local.md:
+
+```bash
+git clone https://github.com/elboletaire/ai-photo-restore.git
+cd ai-photo-restore
+
+# custom nodes and models (resumable; add --turbo for the smaller model, --skip-generative to save ~31 GB)
+uv run skills/restore-photos/scripts/restore.py setup-local --comfy ~/comfy/ComfyUI --python ~/comfy/.venv/bin/python
+
+# start (or restart) ComfyUI so it loads the new nodes, then check everything is in place
+source ~/comfy/.venv/bin/activate && comfy --workspace ~/comfy/ComfyUI launch --background
+uv run skills/restore-photos/scripts/restore.py doctor --backend local
+
+# restore a folder of scans and open restored/index.html to compare the variants
+uv run skills/restore-photos/scripts/restore.py run ~/Pictures/old --repair --generative --full-frame --colorize --out restored
+```
+
+On Windows use the paths of your install (for the portable build, `--comfy ...\ComfyUI_windows_portable\ComfyUI --python ...\python_embeded\python.exe`) and start ComfyUI with `run_nvidia_gpu.bat`.
+
+What the agent would otherwise do for you:
+
+- **Review the overlays.** Check `25-damage-overlay.jpg` and `28-frame-overlay.jpg`. If the detection missed something, paint a mask and rerun that photo with `--mask` or `--frame-mask`.
+- **Pick a fill.** For a full frame that has to invent hands or objects, describe them with `--frame-prompt`, generate a few with `--frame-candidates 3`, look at `28-full-frame-candidates.jpg`, and keep the best with `--frame-seed`.
+- **Fine-tune.** Rerun with a different `--seed`, `--fidelity`, `--tone` or `--saturation`. Only the stages affected by a change are recomputed.
 
 ## Models and hardware
 
