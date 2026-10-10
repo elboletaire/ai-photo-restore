@@ -34,7 +34,7 @@ class FakeBackend:
 
 def args(**kw):
     defaults = dict(fidelity=0.7, no_upscale=False, generative=True, prompt="p", seed=42, megapixels=1.0,
-                    repair=False, mask=None, repair_prompt="r", full_frame=False, frame=None, frame_mask=None, frame_seed=None, frame_prompt="f",
+                    repair=False, mask=None, repair_prompt="r", full_frame=False, frame=None, frame_mask=None, frame_seed=None, frame_candidates=1, frame_quality="fast", frame_prompt="f",
                     colorize=True, tone="keep", no_sharpen=False, saturation=0.85, force=False)
     return argparse.Namespace(**{**defaults, **kw})
 
@@ -163,7 +163,7 @@ def test_repair_only_changes_the_masked_area(tmp_path):
     restore.write_image(mask, m)
 
     class Black:
-        def repair(self, path, mask, prompt, seed, megapixels):
+        def repair(self, path, mask, prompt, seed, megapixels, quality="fast"):
             crop = restore.read_image(path)
             return cv2.imencode(".png", np.zeros((crop.shape[0] * 2, crop.shape[1] * 2, 3), np.uint8))[1].tobytes()
 
@@ -312,7 +312,7 @@ def test_full_frame_changes_only_the_fill(tmp_path):
     restore.write_image(src, img)
 
     class Garbage(FakeBackend):
-        def repair(self, path, mask, prompt, seed, megapixels):
+        def repair(self, path, mask, prompt, seed, megapixels, quality="fast"):
             out = np.random.default_rng(0).integers(0, 256, restore.read_image(path).shape, dtype=np.uint8)
             return cv2.imencode(".png", out)[1].tobytes()
 
@@ -394,7 +394,7 @@ def test_changing_the_frame_seed_reruns_only_the_full_frame_stages(tmp_path):
     b = FakeBackend()
     b.colorize = lambda path: b._echo("colorize", path)
 
-    def repair(path, mask, prompt, seed, megapixels):  # the output depends on the seed, as a model's does
+    def repair(path, mask, prompt, seed, megapixels, quality="fast"):  # the output depends on the seed, as a model's does
         b.calls.append("repair")
         img = restore.read_image(path).astype(int) + seed % 11
         return cv2.imencode(".png", np.clip(img, 0, 255).astype(np.uint8))[1].tobytes()
@@ -414,3 +414,49 @@ def test_dark_floor_strip_on_a_card_keeps_its_strip_and_regenerates_only_the_edg
     assert y1 >= 1500  # the floor strip is not cropped away
     assert fill[1300, 500] == 0  # the picture above the strip is kept
     assert fill[1540, 500] > 0  # the strip's outer band is regenerated
+
+
+def seeded_repair(b):
+    """A fake repair whose output depends on the seed, as a model's does, recording the seeds asked for."""
+    seeds = []
+
+    def repair(path, mask, prompt, seed, megapixels, quality="fast"):
+        seeds.append(seed)
+        b.calls.append("repair")
+        img = restore.read_image(path).astype(int) + seed % 11
+        return cv2.imencode(".png", np.clip(img, 0, 255).astype(np.uint8))[1].tobytes()
+
+    b.repair = repair
+    return seeds
+
+
+def test_candidates_use_consecutive_seeds_and_choosing_one_makes_no_new_call(tmp_path):
+    src = tmp_path / "card.png"
+    restore.write_image(src, vignette_card())
+    b = FakeBackend()
+    seeds = seeded_repair(b)
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, frame_candidates=3))
+    assert seeds == [42, 43, 44]
+    d = tmp_path / "out" / "card"
+    assert (d / "28-full-frame-candidates.jpg").exists()
+    b.calls.clear()
+    restore.restore_one(src, tmp_path / "out", b, args(full_frame=True, colorize=False, frame_candidates=3, frame_seed=44))
+    assert b.calls == ["conservative"]  # only the upscale of the chosen candidate
+    assert seeds == [42, 43, 44]
+    chosen = restore.read_image(d / "28-full-frame-raw.png")
+    assert np.array_equal(chosen, restore.read_image(d / "28-full-frame-raw-s44.png"))
+
+
+def test_high_quality_drops_the_lightning_lora_and_samples_with_guidance(monkeypatch):
+    backend = restore.ComfyBackend("http://comfy")
+    sent = {}
+    monkeypatch.setattr(backend, "_upload", lambda path: "x.png")
+    monkeypatch.setattr(backend, "_run", lambda wf: sent.setdefault("wf", wf) and b"")
+    backend.repair(Path("crop.png"), Path("mask.png"), "p", 7, 1.0, quality="high")
+    wf = sent["wf"]
+    assert not [n for n in wf.values() if n["class_type"] == "LoraLoaderModelOnly"]
+    sampler = next(n for n in wf.values() if n.get("_meta", {}).get("title") == "Sampler")
+    assert sampler["inputs"]["steps"] == restore.HIGH_STEPS and sampler["inputs"]["cfg"] == restore.HIGH_CFG
+    aura = next(n for n in wf.values() if n["class_type"] == "ModelSamplingAuraFlow")
+    unet = next(k for k, n in wf.items() if n["class_type"] == "UNETLoader")
+    assert aura["inputs"]["model"][0] == unet  # the model now comes straight from the UNET

@@ -45,6 +45,7 @@ REPAIR_PROMPT = (
     "Repair the damaged areas of this old photograph: fill in the missing, torn and peeled patches so they "
     "continue the surrounding picture seamlessly. Keep it a black and white photograph."
 )
+HIGH_STEPS, HIGH_CFG = 20, 4.0  # --frame-quality high: the sampler settings without the Lightning LoRA
 FRAME_PROMPT = (
     "Extend this photograph to fill the whole rectangular frame: continue the background, clothing and body "
     "naturally into the empty areas. No oval, mount, border or vignette. Keep it a black and white photograph."
@@ -457,8 +458,12 @@ class ComfyBackend:
         set_input(wf, "Scale", "megapixels", megapixels)
         return self._run(wf)
 
-    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float) -> bytes:
+    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float, quality: str = "fast") -> bytes:
         wf = load_workflow("repair")
+        if quality == "high":  # no Lightning LoRA: real guidance and more steps, slower and cleaner
+            bypass_class(wf, "LoraLoaderModelOnly", "model")
+            set_input(wf, "Sampler", "steps", HIGH_STEPS)
+            set_input(wf, "Sampler", "cfg", HIGH_CFG)
         set_input(wf, "Input image", "image", self._upload(path))
         set_input(wf, "Mask", "image", self._upload(mask))
         set_input(wf, "Prompt", "prompt", prompt)
@@ -511,7 +516,7 @@ class FalBackend:
         return self._call("fal-ai/qwen-image-edit-2511", {"image_urls": [self._data_uri(path)], "prompt": prompt,
                                                           "seed": seed, "output_format": "png"})
 
-    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float) -> bytes:
+    def repair(self, path: Path, mask: Path, prompt: str, seed: int, megapixels: float, quality: str = "fast") -> bytes:
         raise RuntimeError("--repair and --full-frame only work with the local backend for now")
 
     def colorize(self, path: Path) -> bytes:
@@ -552,7 +557,15 @@ def set_input(wf: dict, title: str, key: str, value) -> None:
 
 def bypass(wf: dict, title: str, passthrough: str) -> None:
     """Remove a node, rewiring its consumers to the node's `passthrough` input."""
-    node_id = find_node(wf, title)
+    bypass_node(wf, find_node(wf, title), passthrough)
+
+
+def bypass_class(wf: dict, class_type: str, passthrough: str) -> None:
+    """Like bypass, for the node of this class (for nodes without a title)."""
+    bypass_node(wf, next(k for k, v in wf.items() if v["class_type"] == class_type), passthrough)
+
+
+def bypass_node(wf: dict, node_id: str, passthrough: str) -> None:
     source = wf.pop(node_id)["inputs"][passthrough]
     for node in wf.values():
         for k, v in node["inputs"].items():
@@ -599,7 +612,7 @@ def stage(target: Path, label: str, inputs: list[Path], settings: dict, force: b
 
 
 def inpaint(backend, img: np.ndarray, mask: np.ndarray, prompt: str, a, box=None, outward: bool = True,
-            seed: int | None = None) -> np.ndarray:
+            seed: int | None = None, quality: str = "fast") -> np.ndarray:
     """Regenerate the masked pixels of `img`: send a region around them (or `box`) to the model, then paste
     its result back under the mask. Everything outside the mask stays the same."""
     if not mask.any():
@@ -611,7 +624,7 @@ def inpaint(backend, img: np.ndarray, mask: np.ndarray, prompt: str, a, box=None
         write_image(crop_path, crop)
         write_image(mask_path, mcrop)
         out = cv2.imdecode(np.frombuffer(backend.repair(crop_path, mask_path, prompt, a.seed if seed is None else seed,
-                                                        a.megapixels),
+                                                        a.megapixels, quality),
                                          np.uint8), cv2.IMREAD_COLOR)
     patch = tone_match(cv2.resize(out, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LANCZOS4), crop)
     result = img.copy()
@@ -644,7 +657,26 @@ def merge_boxes(boxes: list[tuple]) -> list[tuple]:
     return boxes
 
 
-def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a) -> bytes:
+def candidate_sheet(candidates: list[tuple[int, Path]], fill: np.ndarray, out: Path) -> None:
+    """The candidate fills side by side, cropped to where they were generated and labelled with their seeds."""
+    ys, xs = np.nonzero(fill)
+    if len(xs):
+        pad = round(0.05 * max(fill.shape))
+        y0, y1 = max(0, ys.min() - pad), min(fill.shape[0], ys.max() + 1 + pad)
+        x0, x1 = max(0, xs.min() - pad), min(fill.shape[1], xs.max() + 1 + pad)
+    else:
+        y0, x0, y1, x1 = 0, 0, fill.shape[0], fill.shape[1]
+    tiles = []
+    for seed, path in candidates:
+        im = read_image(path)[y0:y1, x0:x1]
+        scale = 400 / im.shape[0]
+        im = cv2.resize(im, (max(1, round(im.shape[1] * scale)), 400), interpolation=cv2.INTER_AREA)
+        cv2.putText(im, f"seed {seed}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        tiles += [im, np.full((400, 12, 3), 255, np.uint8)]
+    write_image(out, np.hstack(tiles[:-1]))
+
+
+def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a, seed: int) -> bytes:
     """Fill the picture's missing edges, corners and mount, inside the whole rectangle `box`.
 
     Each separate hole is generated from a padded crop around it, so the model works near native resolution.
@@ -668,8 +700,8 @@ def full_frame(backend, base: Path, box: tuple, fill: np.ndarray, a) -> bytes:
             continue
         mask = np.zeros((h, w), np.uint8)
         mask[bx[1]:bx[3], bx[0]:bx[2]] = todo[bx[1]:bx[3], bx[0]:bx[2]] * 255
-        img = inpaint(backend, img, mask, a.frame_prompt, a, box=bx, outward=False,
-                      seed=a.seed if a.frame_seed is None else a.frame_seed)
+        img = inpaint(backend, img, mask, a.frame_prompt, a, box=bx, outward=False, seed=seed,
+                      quality=a.frame_quality)
         todo[bx[1]:bx[3], bx[0]:bx[2]] = False
     # The model sprinkles bright specks over the smooth dark areas it generates: median them out (fill only).
     med = cv2.medianBlur(img, 5)
@@ -760,10 +792,25 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
             print(f"  ! the frame keeps only {kept:.0%} of the photo: check 28-frame-overlay.jpg")
         frame_mask = d / "28-frame-mask.png"  # an input of the stage, so a change of detection reruns it
         write_image(frame_mask, fill)
-        frame_raw = d / "28-full-frame-raw.png"
-        stage(frame_raw, "full frame (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
-              {"backend": backend.name, "prompt": a.frame_prompt, "seed": frame_seed, "megapixels": a.megapixels,
-               "rect": box}, a.force, lambda: full_frame(backend, base, box, fill, a))
+        # Candidates are the seeds from --seed on; --frame-seed picks one (it is generated if it is not one of them).
+        seeds = list(range(a.seed, a.seed + a.frame_candidates))
+        if frame_seed not in seeds:
+            seeds.append(frame_seed)
+        candidates = []
+        for seed in seeds:
+            raw = d / f"28-full-frame-raw-s{seed}.png"
+            stage(raw, f"full frame, seed {seed} (Qwen-Image-Edit-2511, fills the rectangle)", [base, frame_mask],
+                  {"backend": backend.name, "prompt": a.frame_prompt, "seed": seed, "megapixels": a.megapixels,
+                   "rect": box, "quality": a.frame_quality}, a.force,
+                  lambda seed=seed: full_frame(backend, base, box, fill, a, seed))
+            candidates.append((seed, raw))
+        if len(candidates) > 1:
+            candidate_sheet([(seed, raw) for seed, raw in candidates if seed in seeds[:a.frame_candidates]],
+                            fill[box[1]:box[3], box[0]:box[2]], d / "28-full-frame-candidates.jpg")
+        chosen = d / f"28-full-frame-raw-s{frame_seed}.png"
+        frame_raw = d / "28-full-frame-raw.png"  # the chosen candidate, on to the upscale
+        stage(frame_raw, "full frame: chosen candidate", [chosen], {"seed": frame_seed}, a.force,
+              lambda: chosen.read_bytes())
         frame = d / "29-full-frame.png"
         stage(frame, "full frame: upscale + CodeFormer", [frame_raw],
               {"backend": backend.name, "fidelity": a.fidelity, "upscale": not a.no_upscale}, a.force,
@@ -813,6 +860,9 @@ def cmd_run(a) -> int:
         return 2
     if (a.frame or a.frame_mask) and (len(files) != 1 or not a.full_frame):
         print("--frame and --frame-mask need --full-frame and a single photo", file=sys.stderr)
+        return 2
+    if a.frame_candidates < 1:
+        print("--frame-candidates needs at least 1", file=sys.stderr)
         return 2
     if a.frame:
         h, w = read_image(files[0]).shape[:2]
@@ -942,6 +992,9 @@ def write_sheet(out_root: Path) -> Path:
 <img src="{src(f)}" alt="{label}"><img class="before" src="{src(original)}" alt="Original">
 <input type="range" min="0" max="100" value="50" aria-label="Compare with original"></div>
 <figcaption>{label} <a href="{src(f)}" target="_blank">open</a></figcaption></figure>""")
+            if f == "29-full-frame-final.jpg" and (d / "28-full-frame-candidates.jpg").exists():
+                cells.append(f'<figure><img src="{src("28-full-frame-candidates.jpg")}" alt="Full frame candidates">'
+                             f'<figcaption>Full frame candidates (seeds)</figcaption></figure>')
         rows.append(f'<section><h2>{html.escape(d.name)}</h2><div class="grid">{"".join(cells)}</div></section>')
     page = f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1013,6 +1066,11 @@ def main() -> int:
     r.add_argument("--frame-mask", help="with --full-frame and a single photo: fill this mask (white = to generate) "
                                         "instead of the detected one; the frame stays the detected one or --frame")
     r.add_argument("--frame-prompt", default=FRAME_PROMPT, help="instruction for --full-frame")
+    r.add_argument("--frame-candidates", type=int, default=1,
+                   help="with --full-frame: generate this many fills, with consecutive seeds from --seed; "
+                        "--frame-seed picks one (its contact sheet is 28-full-frame-candidates.jpg)")
+    r.add_argument("--frame-quality", choices=["fast", "high"], default="fast",
+                   help="--full-frame fill quality: fast (4 Lightning steps) or high (20 steps, no LoRA, slower)")
     r.add_argument("--colorize", action="store_true", help="add a DDColor colorized variant")
     r.add_argument("--saturation", type=float, default=0.85,
                    help="colorized variant: colour strength (1 = as DDColor makes it, 0 = grey)")
