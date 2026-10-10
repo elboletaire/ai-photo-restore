@@ -319,6 +319,20 @@ def test_the_frame_is_coloured_inside_its_surroundings_and_cropped_back(tmp_path
     assert not np.array_equal(color, tint(frame))  # and not the frame coloured alone
 
 
+def test_colour_context_never_overflows_at_fractional_scales():
+    rng = np.random.default_rng(1)
+    for _ in range(200):
+        base_h, base_w = (int(v) for v in rng.integers(50, 400, 2))
+        x0, y0 = (int(v) for v in rng.integers(0, 30, 2))
+        x1, y1 = base_w - int(rng.integers(0, 30)), base_h - int(rng.integers(0, 30))
+        box = (x0, y0, x1, y1)
+        frame = np.full((round((y1 - y0) * 2.37), round((x1 - x0) * 2.37), 3), 77, np.uint8)
+        canvas = np.zeros((base_h, base_w, 3), np.uint8)
+        out = restore.colour_context(canvas, frame, (base_h, base_w), box)
+        x, y, w, h = restore.frame_rect(frame.shape, box)
+        assert np.array_equal(restore.crop_back(out, (x, y, w, h)), frame)
+
+
 def test_the_canvas_is_the_repaired_picture_when_repairing(tmp_path):
     src = tmp_path / "card.png"
     restore.write_image(src, vignette_card())

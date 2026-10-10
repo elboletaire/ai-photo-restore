@@ -103,7 +103,7 @@ The tests use a fake backend, so they need neither ComfyUI nor fal. [examples/](
 
 - **CodeFormer**: [S-Lab License 1.0](https://github.com/sczhou/CodeFormer/blob/master/LICENSE), **non-commercial use only**.
 - Qwen-Image-Edit-2511 and its Lightning LoRA, DDColor: Apache-2.0.
-- Qwen-Image-2.1-Turbo (`--qwen-model turbo`, experimental): [Qwen Research License](https://huggingface.co/Comfy-Org/Qwen-Image-2.1), **non-commercial use only**.
+- **Qwen-Image-2.1-Turbo** (`--qwen-model turbo`, experimental): [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE), **non-commercial use only**.
 - Real-ESRGAN: BSD-3-Clause.
 
 Restoring your own family photos is fine. For commercial work, review the model licenses first: CodeFormer in particular doesn't allow it.

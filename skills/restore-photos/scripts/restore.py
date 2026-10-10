@@ -730,11 +730,13 @@ def colour_context(canvas: np.ndarray, frame: np.ndarray, base_shape: tuple, box
     rectangle in that picture. The canvas is scaled to the frame's scale and the frame is pasted at its rectangle.
     """
     fh, fw = frame.shape[:2]
-    out = cv2.resize(canvas, (round(base_shape[1] * fw / (box[2] - box[0])),
-                              round(base_shape[0] * fh / (box[3] - box[1]))), interpolation=cv2.INTER_CUBIC)
+    x0, y0, x1, y1 = box
+    sx, sy = fw / (x1 - x0), fh / (y1 - y0)
     x, y, w, h = frame_rect(frame.shape, box)
-    if x + w > out.shape[1] or y + h > out.shape[0]:
-        raise ValueError("the frame does not fit in the upscaled picture")
+    # The usual size, grown by a pixel where the rounding of the frame's own position would overflow it.
+    W = max(round(base_shape[1] * sx), x + w + round((base_shape[1] - x1) * sx))
+    H = max(round(base_shape[0] * sy), y + h + round((base_shape[0] - y1) * sy))
+    out = cv2.resize(canvas, (W, H), interpolation=cv2.INTER_CUBIC)
     out[y:y + h, x:x + w] = frame
     return out
 
@@ -932,9 +934,9 @@ def restore_one(src: Path, out_root: Path, backend, a, name: str | None = None) 
         bases = [(color_base, d / "30-color.png")]
         if a.repair:
             bases.append((repaired, d / "31-repaired-color.png"))
-        for base, color in bases:
-            stage(color, f"colorize {base.stem} (DDColor)", [base], {"backend": backend.name}, a.force,
-                  lambda base=base: backend.colorize(base))
+        for src, color in bases:
+            stage(color, f"colorize {src.stem} (DDColor)", [src], {"backend": backend.name}, a.force,
+                  lambda src=src: backend.colorize(src))
             variants.append((color, "color"))
         if frame:
             # The frame alone looks green to DDColor (no surroundings to tell the skin and paper apart), so it is
